@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-vCardTra — Convert vCard (.vcf) files to text, JSON, and other formats.
-Supports vCard 2.1, 3.0, and 4.0.
+vCardTra — Convert vCard (.vcf) contact exports to text, JSON, CSV,
+Markdown, HTML, SQL, XML, ICS, and more (PDF/DOCX require optional
+libraries). Also merges/dedupes multiple files, converts between vCard
+2.1/3.0/4.0, and previews contacts interactively in the terminal.
 """
 
-__version__ = '4.0'
+__version__ = '5.0'
 
 import sys
 import re
@@ -15,6 +17,7 @@ import csv
 import io
 import html
 import sqlite3
+import time
 from xml.sax.saxutils import escape as xml_escape
 from datetime import datetime
 from pathlib import Path
@@ -83,6 +86,7 @@ FORMAT_EXTENSIONS = {
     'xml': 'xml',
     'pdf': 'pdf',
     'docx': 'docx',
+    'template': 'txt',
 }
 
 # Formats speced in CONTEXT.md but not yet implemented — kept separate from
@@ -636,8 +640,7 @@ def parse_vcard(content, no_photos=False):
                 if sum(c.isdigit() for c in value) < 5:
                     raise ValueError(f"Too short: {value}")
                 label = extract_type(key_part)
-                entry = f"Phone: {value} ({label})" if label else f"Phone: {value}"
-                contact.setdefault('phones', []).append(entry)
+                contact.setdefault('phones', []).append({'value': value, 'type': label})
 
             elif prop == 'EMAIL':
                 if not value:
@@ -649,8 +652,7 @@ def parse_vcard(content, no_photos=False):
                 if not local or not domain or '.' not in domain:
                     raise ValueError(f"Invalid email: {value}")
                 label = extract_type(key_part)
-                entry = f"Email: {value} ({label})" if label else f"Email: {value}"
-                contact.setdefault('emails', []).append(entry)
+                contact.setdefault('emails', []).append({'value': value, 'type': label})
 
             elif prop in ('ADR', 'ADDR'):
                 parts = [unescape(p) for p in value.split(';')]
@@ -701,6 +703,16 @@ def parse_vcard(content, no_photos=False):
                 if not valid:
                     raise ValueError(f"Unrecognized format: {value}")
                 contact['birthday'] = format_date(value)
+                # D2 fix: store a chronologically-sortable raw key alongside
+                # the display string (same _raw pattern already used for
+                # REV/CREATED) — --sort-by birthday previously sorted on the
+                # display string itself, which put contacts in alphabetical-
+                # by-month-name order, not chronological order (found via
+                # code review — reproduced live: a January birthday sorted
+                # after an August one). Computed once here, reused by
+                # --sort-by birthday and by format_ics()/_vcard_date_value()
+                # below instead of each re-parsing the display string.
+                contact['_birthday_raw'] = _date_sort_key(*parse_display_date(contact['birthday']))
 
             elif prop == 'NICKNAME':
                 if value:
@@ -713,6 +725,7 @@ def parse_vcard(content, no_photos=False):
             elif prop == 'ANNIVERSARY':
                 if value:
                     contact['anniversary'] = format_date(value)
+                    contact['_anniversary_raw'] = _date_sort_key(*parse_display_date(contact['anniversary']))
 
             elif prop == 'GENDER':
                 if value:
@@ -788,6 +801,21 @@ def parse_vcard(content, no_photos=False):
 # Formatter
 # ---------------------------------------------------------------------------
 
+def _phone_display(phone):
+    """
+    Render a structured phone dict ({'value':..., 'type':...}) as the
+    display line used across text/Markdown/HTML/DOCX output:
+      {'value': '+1-555-0101', 'type': 'Work'} -> "Phone: +1-555-0101 (Work)"
+      {'value': '+1-555-0101', 'type': None}   -> "Phone: +1-555-0101"
+    """
+    return f"Phone: {phone['value']} ({phone['type']})" if phone.get('type') else f"Phone: {phone['value']}"
+
+
+def _email_display(email):
+    """Same as _phone_display() but for the emails list. See that docstring."""
+    return f"Email: {email['value']} ({email['type']})" if email.get('type') else f"Email: {email['value']}"
+
+
 def format_contact(contact):
     """Render a contact dict as a human-readable text block."""
     lines = []
@@ -801,10 +829,10 @@ def format_contact(contact):
         lines.append(f"Title: {contact['title']}")
 
     for phone in contact.get('phones', []):
-        lines.append(phone)
+        lines.append(_phone_display(phone))
 
     for email in contact.get('emails', []):
-        lines.append(email)
+        lines.append(_email_display(email))
 
     for addr in contact.get('addresses', []):
         lines.append(f"Address: {addr}")
@@ -851,22 +879,70 @@ def format_contact(contact):
     return '\n'.join(lines)
 
 
-def format_vcf(contact):
+def _vcard_date_value(raw_key, target_version):
     """
-    Render a contact dict as a valid vCard 3.0 block.
+    Rebuild a proper vCard date value (ISO 8601, or --MMDD for a yearless
+    4.0 date) from a _birthday_raw/_anniversary_raw sort key (D2 fix —
+    see _date_sort_key()/_decode_date_key()) instead of re-parsing the
+    display string via parse_display_date() as this used to. Returns
+    None if the date can't be represented at all in target_version —
+    caller should skip the field and count a warning.
 
-    Phones and emails are stored as presentation strings (D1 design decision),
-    so we reverse-parse them to extract the raw value and type label:
-      "Phone: +1-555-0101 (Work)"  →  TEL;TYPE=WORK:+1-555-0101
-      "Email: j@x.com (Work)"      →  EMAIL;TYPE=WORK:j@x.com
+    - Year + month + day available            -> "YYYYMMDD" (both 3.0, 4.0)
+    - No year, but month + day available       -> "--MMDD" for 4.0 only;
+      3.0 has no valid representation for a yearless date, so None
+    - No day-level precision (year-only, or
+      nothing usable at all)                   -> None
+    """
+    if not raw_key:
+        return None
+    year, month, day = _decode_date_key(raw_key)
+    if not month or not day:
+        return None
+    if year:
+        return f"{year:04d}{month:02d}{day:02d}"
+    if target_version == '4.0':
+        return f"--{month:02d}{day:02d}"
+    return None
+
+
+def format_vcf(contact, target_version='3.0'):
+    """
+    Render a contact dict as a valid vCard block, targeting either
+    version 3.0 (default, used by --merge/--split) or 4.0 (--convert-to).
+
+    Phones and emails are stored as structured dicts ({'value':..., 'type':...},
+    v5 D1 refactor), so reassembly is a direct field mapping rather than the
+    reverse-parsing v4 needed:
+      {'value': '+1-555-0101', 'type': 'Work'}  →  TEL;TYPE=WORK:+1-555-0101
+      {'value': 'j@x.com', 'type': 'Work'}      →  EMAIL;TYPE=WORK:j@x.com
+    For target_version='4.0', phones/emails additionally get tel:/mailto:
+    URI prefixes (a real 3.0<->4.0 difference — see CONTEXT.md).
+
+    BDAY/ANNIVERSARY are rebuilt via _vcard_date_value() from the stored
+    display string rather than written as that display string directly —
+    "BDAY:April 12, 1985" is not valid vCard date syntax and would confuse
+    or break a real contacts app importing this file. This was a
+    pre-existing bug (present since v2/v3, unrelated to D1) found and fixed
+    while building the v5 version converter. A yearless date (e.g. from a
+    4.0-sourced --MMDD birthday) can be represented in a 4.0 target but not
+    a 3.0 target; when it can't be represented, the field is skipped and
+    reported back to the caller (second return value) rather than silently
+    dropped or corrupted — same "skip and count, don't crash or corrupt"
+    approach format_ics() already uses for its own date-precision gaps.
 
     _revised_raw / _created_raw are used for REV/CREATED so the output
     contains the original ISO timestamps, not the formatted display strings.
 
     Custom fields have their display name reversed back to X- form:
       {'Skype': 'john'} → X-SKYPE:john
+
+    Returns (vcf_text, skipped) — skipped is a list of short strings
+    describing any BDAY/ANNIVERSARY that couldn't be represented in
+    target_version (empty list in the common case).
     """
-    lines = ['BEGIN:VCARD', 'VERSION:3.0']
+    skipped = []
+    lines = ['BEGIN:VCARD', f'VERSION:{target_version}']
 
     if contact.get('name'):
         lines.append(f"FN:{contact['name']}")
@@ -877,28 +953,25 @@ def format_vcf(contact):
     if contact.get('title'):
         lines.append(f"TITLE:{contact['title']}")
 
-    # Reverse-parse "Phone: +1-555-0101 (Work/Voice)" → TEL;TYPE=WORK,VOICE:+1-555-0101
-    for entry in contact.get('phones', []):
-        # Format: "Phone: <value>" or "Phone: <value> (<type>)"
-        rest = entry[len('Phone: '):]
-        if rest.endswith(')') and ' (' in rest:
-            value, type_str = rest.rsplit(' (', 1)
-            type_str = type_str[:-1]  # strip trailing )
-            type_param = ','.join(p.upper() for p in type_str.split('/'))
-            lines.append(f"TEL;TYPE={type_param}:{value}")
+    # {'value': '+1-555-0101', 'type': 'Work/Voice'} -> TEL;TYPE=WORK,VOICE:+1-555-0101
+    # 4.0 adds the tel: URI prefix; 3.0 does not (see docstring)
+    tel_prefix = 'tel:' if target_version == '4.0' else ''
+    for phone in contact.get('phones', []):
+        if phone.get('type'):
+            type_param = ','.join(p.upper() for p in phone['type'].split('/'))
+            lines.append(f"TEL;TYPE={type_param}:{tel_prefix}{phone['value']}")
         else:
-            lines.append(f"TEL:{rest}")
+            lines.append(f"TEL:{tel_prefix}{phone['value']}")
 
-    # Reverse-parse "Email: j@x.com (Work/Internet)" → EMAIL;TYPE=WORK,INTERNET:j@x.com
-    for entry in contact.get('emails', []):
-        rest = entry[len('Email: '):]
-        if rest.endswith(')') and ' (' in rest:
-            value, type_str = rest.rsplit(' (', 1)
-            type_str = type_str[:-1]
-            type_param = ','.join(p.upper() for p in type_str.split('/'))
-            lines.append(f"EMAIL;TYPE={type_param}:{value}")
+    # {'value': 'j@x.com', 'type': 'Work/Internet'} -> EMAIL;TYPE=WORK,INTERNET:j@x.com
+    # 4.0 adds the mailto: URI prefix; 3.0 does not (see docstring)
+    mailto_prefix = 'mailto:' if target_version == '4.0' else ''
+    for email in contact.get('emails', []):
+        if email.get('type'):
+            type_param = ','.join(p.upper() for p in email['type'].split('/'))
+            lines.append(f"EMAIL;TYPE={type_param}:{mailto_prefix}{email['value']}")
         else:
-            lines.append(f"EMAIL:{rest}")
+            lines.append(f"EMAIL:{mailto_prefix}{email['value']}")
 
     # Addresses stored as "street, city, state, zip, country (Type)"
     # We write them to ADR field 3 (street) only — full structured reassembly
@@ -917,7 +990,14 @@ def format_vcf(contact):
         lines.append(f"URL:{url}")
 
     if contact.get('birthday'):
-        lines.append(f"BDAY:{contact['birthday']}")
+        date_val = _vcard_date_value(contact.get('_birthday_raw'), target_version)
+        if date_val:
+            lines.append(f"BDAY:{date_val}")
+        else:
+            skipped.append(
+                f"BDAY: {contact.get('name') or '(Unknown)'} — "
+                f"no year, not representable in vCard {target_version}"
+            )
 
     for note in contact.get('notes', []):
         # Re-escape newlines for vCard
@@ -932,7 +1012,14 @@ def format_vcf(contact):
         lines.append(f"LABEL:{escaped}")
 
     if contact.get('anniversary'):
-        lines.append(f"ANNIVERSARY:{contact['anniversary']}")
+        date_val = _vcard_date_value(contact.get('_anniversary_raw'), target_version)
+        if date_val:
+            lines.append(f"ANNIVERSARY:{date_val}")
+        else:
+            skipped.append(
+                f"ANNIVERSARY: {contact.get('name') or '(Unknown)'} — "
+                f"no year, not representable in vCard {target_version}"
+            )
 
     if contact.get('gender'):
         lines.append(f"GENDER:{contact['gender']}")
@@ -958,18 +1045,17 @@ def format_vcf(contact):
         lines.append(f"{prop_name}:{field_value}")
 
     lines.append('END:VCARD')
-    return '\n'.join(lines)
+    return '\n'.join(lines), skipped
 
 
 def contact_to_json_dict(contact, include_photos=True):
     """
     Convert an internal contact dict into a JSON-serializable dict.
 
-    Note (D1 design decision, unchanged in v4): phones and emails are still
-    stored as presentation strings ("Phone: +1-555-0101 (Work)") rather than
-    structured {'value':..., 'type':...} dicts — that refactor is deferred
-    to the v5 D1 rework so parser/formatter/dedup change together. JSON
-    consumers get the same presentation strings as the text output for now.
+    Note (v5 D1 refactor): phones and emails are structured
+    {'value':..., 'type':...} dicts, so they pass straight through as JSON
+    arrays of objects — no display-string building here. XML inherits this
+    shape for free via dict_to_xml()'s generic list-of-dicts handling.
 
     include_photos : if False, PHOTO/LOGO data is omitted even if the
                       contact has it (mirrors --no-photos at output time,
@@ -1080,27 +1166,14 @@ def _render_text(all_contacts, header_rows, single_mode, malformed, exact_remove
     return '\n'.join(lines)
 
 
-def _strip_field_prefix(value, prefix):
-    """
-    Strip a leading 'Phone: ' / 'Email: ' style prefix from a presentation
-    string, for formats (CSV, SQL, XML) where the column/tag name already
-    says what the field is — text/Markdown/HTML keep the prefix since it
-    reads naturally inline there.
-    """
-    return value[len(prefix):] if value.startswith(prefix) else value
-
-
 def contact_to_flat_dict(contact):
     """
     Convert a contact dict into a flat, single-valued dict for row-based
     formats (CSV wide columns, SQL/SQLite single table, XML attributes).
     Multi-value fields (organizations, notes, impp) are joined with ' | ';
     phones/emails/addresses/urls are handled separately by callers that
-    need numbered columns (CSV) since a flat join loses the per-value
-    structure those formats want to preserve.
-
-    Same D1 caveat as contact_to_json_dict(): phones/emails stay as
-    presentation strings, not structured dicts (deferred to v5).
+    need numbered columns (CSV) or per-value display strings (SQL) since a
+    flat join loses the per-value structure those formats want to preserve.
     """
     return {
         'name':            contact.get('name') or '',
@@ -1133,6 +1206,13 @@ def format_csv(all_contacts):
     CSV has no native concept of a repeated field. Column count is set by
     the contact with the most values for that field across the whole run.
 
+    Phones/emails (v5 D1 structured dicts) get a paired Type column each
+    (Phone1, Phone1Type, Phone2, Phone2Type, ...) instead of the type baked
+    into one cell as free text — makes the type independently filterable/
+    sortable in a spreadsheet. Addresses/URLs stay single-column: they were
+    not part of the D1 refactor and have no separate "type" to split out
+    cleanly (address type is already folded into the address text itself).
+
     Photos/logos are skipped entirely (binary data has no sane CSV
     representation) — matches the v4 plan table.
     """
@@ -1142,8 +1222,10 @@ def format_csv(all_contacts):
     max_urls      = max((len(c.get('urls', []))       for c in all_contacts), default=0)
 
     fieldnames = ['Name', 'Organizations', 'Title']
-    fieldnames += [f'Phone{i+1}' for i in range(max_phones)]
-    fieldnames += [f'Email{i+1}' for i in range(max_emails)]
+    for i in range(max_phones):
+        fieldnames += [f'Phone{i+1}', f'Phone{i+1}Type']
+    for i in range(max_emails):
+        fieldnames += [f'Email{i+1}', f'Email{i+1}Type']
     fieldnames += [f'Address{i+1}' for i in range(max_addresses)]
     fieldnames += ['Birthday']
     fieldnames += [f'URL{i+1}' for i in range(max_urls)]
@@ -1179,9 +1261,11 @@ def format_csv(all_contacts):
         row['Skipped Fields'] = row.pop('skipped_fields')
 
         for i, p in enumerate(c.get('phones', [])):
-            row[f'Phone{i+1}'] = _strip_field_prefix(p, 'Phone: ')
+            row[f'Phone{i+1}'] = p['value']
+            row[f'Phone{i+1}Type'] = p.get('type') or ''
         for i, e in enumerate(c.get('emails', [])):
-            row[f'Email{i+1}'] = _strip_field_prefix(e, 'Email: ')
+            row[f'Email{i+1}'] = e['value']
+            row[f'Email{i+1}Type'] = e.get('type') or ''
         for i, a in enumerate(c.get('addresses', [])):
             row[f'Address{i+1}'] = a
         for i, u in enumerate(c.get('urls', [])):
@@ -1219,9 +1303,9 @@ def format_markdown(all_contacts, header_rows, single_mode):
         if c.get('title'):
             lines.append(f"- **Title:** {c['title']}")
         for phone in c.get('phones', []):
-            lines.append(f"- {phone}")
+            lines.append(f"- {_phone_display(phone)}")
         for email in c.get('emails', []):
-            lines.append(f"- {email}")
+            lines.append(f"- {_email_display(email)}")
         for addr in c.get('addresses', []):
             lines.append(f"- **Address:** {addr}")
         for url in c.get('urls', []):
@@ -1258,6 +1342,87 @@ def format_markdown(all_contacts, header_rows, single_mode):
         lines.append('')
 
     return '\n'.join(lines)
+
+
+TEMPLATE_TOKEN_RE = re.compile(r'\{(\w+)\}')
+
+
+def load_template(path):
+    """
+    Read a --template file's contents. Raises ValueError with a clean
+    message on missing/unreadable file — caller (main()) reports it and
+    exits rather than letting a raw exception through.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise ValueError(f"Template file not found: {path}")
+    try:
+        return p.read_text(encoding='utf-8')
+    except OSError as e:
+        raise ValueError(f"Could not read template file: {e}")
+
+
+def _template_tokens(contact):
+    """
+    Build the {token: value} lookup for one contact, for render_template().
+    Multi-value fields are joined with ', ' into a single string — the
+    v5 --template flag is deliberately simple (one flat token per field,
+    no loop/conditional syntax), so there's no way to iterate phones/emails
+    individually within the template; that's the documented trade-off for
+    keeping this a plain string-substitution feature with zero new syntax
+    to learn, rather than a template language.
+    """
+    return {
+        'name': contact.get('name') or '(Unknown)',
+        'organizations': ', '.join(contact.get('organizations', [])),
+        'title': contact.get('title') or '',
+        'phones': ', '.join(_phone_display(p)[len('Phone: '):] for p in contact.get('phones', [])),
+        'emails': ', '.join(_email_display(e)[len('Email: '):] for e in contact.get('emails', [])),
+        'addresses': ', '.join(contact.get('addresses', [])),
+        'urls': ', '.join(contact.get('urls', [])),
+        'birthday': contact.get('birthday') or '',
+        'notes': ', '.join(contact.get('notes', [])),
+        'nickname': contact.get('nickname') or '',
+        'label': contact.get('label') or '',
+        'anniversary': contact.get('anniversary') or '',
+        'gender': contact.get('gender') or '',
+        'categories': contact.get('categories') or '',
+        'created': contact.get('created') or '',
+        'revised': contact.get('revised') or '',
+        'source': contact.get('_source') or '',
+    }
+
+
+def render_template(contact, template_text):
+    """
+    Substitute {token} placeholders in template_text for one contact.
+    Recognised-but-empty fields become '' (so a template line like
+    "Title: {title}" just prints "Title: " for a contact with no title —
+    the user's template controls whether that's acceptable or should be
+    conditional, which this simple substitution doesn't support).
+    Unrecognised tokens (typos) are left as literal {like_this} rather than
+    silently becoming '' — makes template mistakes visible instead of
+    quietly producing blank output.
+    """
+    tokens = _template_tokens(contact)
+
+    def _sub(match):
+        key = match.group(1)
+        return tokens[key] if key in tokens else match.group(0)
+
+    return TEMPLATE_TOKEN_RE.sub(_sub, template_text)
+
+
+def format_template(all_contacts, template_path):
+    """
+    Render every contact through the user's --template file, joined with a
+    blank line between contacts — same separator convention as text/VCF
+    output. template_path is loaded fresh here (not passed as pre-read
+    text) so any file error surfaces at write time with the same
+    OSError/ValueError handling convert()'s try/except already has.
+    """
+    template_text = load_template(template_path)
+    return '\n\n'.join(render_template(c, template_text) for c in all_contacts)
 
 
 def format_html(all_contacts, header_rows, single_mode, include_photos=True):
@@ -1323,9 +1488,9 @@ h1 { font-size: 1.5rem; }
         if c.get('role'):
             parts.append(f'<div class="field"><b>Role:</b> {esc(c["role"])}</div>')
         for phone in c.get('phones', []):
-            parts.append(f'<div class="field">{esc(phone)}</div>')
+            parts.append(f'<div class="field">{esc(_phone_display(phone))}</div>')
         for email in c.get('emails', []):
-            parts.append(f'<div class="field">{esc(email)}</div>')
+            parts.append(f'<div class="field">{esc(_email_display(email))}</div>')
         for addr in c.get('addresses', []):
             parts.append(f'<div class="field"><b>Address:</b> {esc(addr)}</div>')
         for url in c.get('urls', []):
@@ -1407,6 +1572,42 @@ def parse_display_date(value):
     return (None, None, None)
 
 
+def _date_sort_key(year, month, day):
+    """
+    Build a sortable 'YYYYMMDD'-style string from a (year, month, day)
+    tuple (any component may be None) — used for _birthday_raw/
+    _anniversary_raw (see D2 fix below), computed once at parse time so
+    --sort-by birthday and every date-consuming formatter share one
+    correct, chronologically-sortable value instead of each re-deriving
+    it from the display string.
+
+    - Full date -> zero-padded "YYYYMMDD", sorts correctly by real value
+    - Missing year -> "0000MMDD" — groups all yearless dates together,
+      sorted by month/day among themselves, before every dated entry
+    - Missing month/day -> zero-filled the same way
+    - Nothing usable at all -> '' (falsy), so it sorts last via the same
+      "not bool(primary) sorts last" convention every other --sort-by
+      field already uses — no special-casing needed for that case
+    """
+    if year is None and month is None and day is None:
+        return ''
+    return f"{year or 0:04d}{month or 0:02d}{day or 0:02d}"
+
+
+def _decode_date_key(key):
+    """
+    Inverse of _date_sort_key() — decode a _birthday_raw/_anniversary_raw
+    string back into (year, month, day) ints. A '00'/'0000' segment
+    (an originally-unknown component) decodes to plain 0, which behaves
+    identically to None in every caller here: both format_ics() (`if
+    month and day`) and _vcard_date_value() only ever check truthiness,
+    never `is None`, so no separate None-conversion step is needed.
+    """
+    if not key:
+        return (0, 0, 0)
+    return (int(key[0:4]), int(key[4:6]), int(key[6:8]))
+
+
 def format_ics(all_contacts):
     """
     Render birthdays and anniversaries as a yearly-recurring ICS calendar.
@@ -1418,8 +1619,31 @@ def format_ics(all_contacts):
     since RRULE:FREQ=YEARLY repeats regardless); events with no year use
     1900 as a conventional placeholder, following the common iCal practice
     for "unknown year" recurring reminders, and say so in the description.
+
+    Also skips (and counts) calendar-invalid dates — e.g. April 31, which
+    parse_vcard() accepts and stores rather than rejecting (see CONTEXT.md
+    Design Decisions: "Calendar accuracy" — losing a birthday entirely over
+    one bad digit is worse than showing a fact that might be slightly off,
+    for text/CSV/JSON/etc. output). ICS is different: DTSTART is read by
+    other people's calendar software, not just displayed. Verified with a
+    real RFC 5545 parser that BDAY:19850431 produces a rejected/broken
+    VEVENT on import — not "slightly wrong," genuinely malformed. So this
+    one format gets a real calendar-validity check before emitting a
+    VEVENT, using the same skip-and-count pattern already used for
+    day-imprecise dates just above, rather than a new reporting mechanism.
     """
     lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//vCardTra//v4//EN', 'CALSCALE:GREGORIAN']
+
+    def is_valid_calendar_date(year, month, day):
+        # datetime's constructor validates day-of-month for the given
+        # month/leap-year same as date() would. A missing year (0) is
+        # checked against 2000 — a leap year — so Feb 29 with an unknown
+        # year still validates rather than being unfairly rejected.
+        try:
+            datetime(year or 2000, month, day)
+            return True
+        except ValueError:
+            return False
 
     def add_event(name, kind, year, month, day, uid_suffix):
         display_year = year if year else 1900
@@ -1436,15 +1660,15 @@ def format_ics(all_contacts):
     skipped = 0
     for i, c in enumerate(all_contacts, 1):
         name = c.get('name') or '(Unknown)'
-        if c.get('birthday'):
-            year, month, day = parse_display_date(c['birthday'])
-            if month and day:
+        if c.get('_birthday_raw'):
+            year, month, day = _decode_date_key(c['_birthday_raw'])
+            if month and day and is_valid_calendar_date(year, month, day):
                 add_event(name, 'Birthday', year, month, day, f"bday-{i}")
             else:
                 skipped += 1
-        if c.get('anniversary'):
-            year, month, day = parse_display_date(c['anniversary'])
-            if month and day:
+        if c.get('_anniversary_raw'):
+            year, month, day = _decode_date_key(c['_anniversary_raw'])
+            if month and day and is_valid_calendar_date(year, month, day):
                 add_event(name, 'Anniversary', year, month, day, f"anniv-{i}")
             else:
                 skipped += 1
@@ -1477,11 +1701,18 @@ SQL_COLUMNS = [
 
 
 def _contact_sql_row(idx, contact):
-    """Build one row's values in SQL_COLUMNS order, for SQL and SQLite."""
+    """
+    Build one row's values in SQL_COLUMNS order, for SQL and SQLite.
+
+    Phones/emails (v5 D1 structured dicts) are rendered as the same
+    "value (Type)" display text as text/CSV, then joined with ' | ' —
+    single wide table stays consistent with the other row-based formats
+    rather than normalizing into child tables (see CONTEXT.md D1 v5 notes).
+    """
     flat = contact_to_flat_dict(contact)
     row = [idx, flat['name'], flat['organizations'], flat['title']]
-    row.append(' | '.join(_strip_field_prefix(p, 'Phone: ') for p in contact.get('phones', [])))
-    row.append(' | '.join(_strip_field_prefix(e, 'Email: ') for e in contact.get('emails', [])))
+    row.append(' | '.join(_phone_display(p)[len('Phone: '):] for p in contact.get('phones', [])))
+    row.append(' | '.join(_email_display(e)[len('Email: '):] for e in contact.get('emails', [])))
     row.append(' | '.join(contact.get('addresses', [])))
     row.append(flat['birthday'])
     row.append(' | '.join(contact.get('urls', [])))
@@ -1495,9 +1726,12 @@ def _contact_sql_row(idx, contact):
 def format_sql(all_contacts):
     """
     Render a single wide 'contacts' table as plain .sql text: one
-    CREATE TABLE plus one INSERT per contact. Same single-table, D1-deferred
-    shape as CSV/XML (see contact_to_flat_dict) — normalizing phones/emails
-    into their own tables is a v5 D1-refactor-scale change, not a v4 one.
+    CREATE TABLE plus one INSERT per contact. Phones/emails (structured
+    dicts internally since the v5 D1 refactor) are rendered back into a
+    single joined text column, same shape as CSV's flat fields and XML —
+    child tables for phones/emails were considered during D1 and explicitly
+    declined (see CONTEXT.md) to keep the single-table shape consistent
+    with the other row-based formats.
     """
     lines = ['-- Generated by vCardTra', 'BEGIN TRANSACTION;', '']
     lines.append('CREATE TABLE IF NOT EXISTS contacts (')
@@ -1685,9 +1919,9 @@ def write_docx(all_contacts, header_rows, single_mode, out_path, include_photos=
         if c.get('role'):
             document.add_paragraph(f"Role: {c['role']}")
         for phone in c.get('phones', []):
-            document.add_paragraph(phone)
+            document.add_paragraph(_phone_display(phone))
         for email in c.get('emails', []):
-            document.add_paragraph(email)
+            document.add_paragraph(_email_display(email))
         for addr in c.get('addresses', []):
             document.add_paragraph(f"Address: {addr}")
         for url in c.get('urls', []):
@@ -1733,21 +1967,36 @@ def identity_key(contact):
       4 — organizations
       5 — birthday
 
-    If new identity fields are added to the script (e.g. IMPP),
-    add them here too or duplicate detection will miss differences in that field.
+    If new identity fields are added to the script in future (e.g. a
+    hypothetical structured GEO-based location match), add them here too
+    or duplicate detection will miss differences in that field. Note:
+    IMPP (added in v4) was deliberately kept a non-identity field — two
+    contacts can have different IM handles and still be the same person,
+    so it's merged like urls (see merge_contacts() below) rather than
+    compared here.
     """
-    def bare(entries):
-        result = set()
-        for e in entries:
-            val = e.split(':', 1)[1].split('(')[0].strip() if ':' in e else e
-            result.add(val.lower())
-        return frozenset(result)
+    def bare_values(entries):
+        """For phones/emails (v5 D1 structured dicts) — bare value only, no type."""
+        return frozenset(e['value'].lower() for e in entries)
+
+    def bare_strings(entries):
+        """
+        For addresses (still plain strings, not part of the D1 refactor).
+        Preserves exact pre-D1 behavior: only strips a "label: " prefix if
+        present (addresses never have one in practice, so this is
+        effectively a no-op lowercase — the trailing "(Type)" is NOT
+        stripped, matching v4's identity_key() behavior unchanged).
+        """
+        return frozenset(
+            (e.split(':', 1)[1].split('(')[0].strip() if ':' in e else e).lower()
+            for e in entries
+        )
 
     return (
         (contact.get('name') or '').strip().lower(),
-        bare(contact.get('phones', [])),
-        bare(contact.get('emails', [])),
-        bare(contact.get('addresses', [])),
+        bare_values(contact.get('phones', [])),
+        bare_values(contact.get('emails', [])),
+        bare_strings(contact.get('addresses', [])),
         frozenset(o.lower() for o in contact.get('organizations', [])),
         (contact.get('birthday') or '').lower(),
     )
@@ -1778,6 +2027,14 @@ def merge_contacts(base, duplicate):
                   'role', 'timezone', 'geo'):
         if not base.get(field) and duplicate.get(field):
             base[field] = duplicate[field]
+
+    # anniversary's companion raw sort key (D2 fix) needs to travel with it —
+    # the generic loop above only knows about 'anniversary' itself, so
+    # without this, a rescued anniversary would have no matching
+    # _anniversary_raw, silently breaking any downstream sort/ICS/convert-to
+    # use of it on the merged contact.
+    if base.get('anniversary') and not base.get('_anniversary_raw') and duplicate.get('_anniversary_raw'):
+        base['_anniversary_raw'] = duplicate['_anniversary_raw']
 
     # IMPP: merge unique values, same pattern as urls below
     if duplicate.get('impp'):
@@ -1883,16 +2140,10 @@ def classify_duplicates(contacts):
             kept.append(contact)
 
     def phone_vals(c):
-        return {
-            p.split(':', 1)[1].split('(')[0].strip().lower()
-            for p in c.get('phones', [])
-        }
+        return {p['value'].lower() for p in c.get('phones', [])}
 
     def email_vals(c):
-        return {
-            e.split(':', 1)[1].split('(')[0].strip().lower()
-            for e in c.get('emails', [])
-        }
+        return {e['value'].lower() for e in c.get('emails', [])}
 
     fuzzy_warnings = []
     for i in range(len(kept)):
@@ -1922,6 +2173,7 @@ def run_paged_preview(contacts, fuzzy_pairs=None):
     Controls:
       Enter / n   next page
       b           previous page
+      d           show full detail for every contact on the current page
       /<term>     search by name, org, or phone (press Enter to clear)
       q           quit
 
@@ -1945,9 +2197,7 @@ def run_paged_preview(contacts, fuzzy_pairs=None):
             org     = (c.get('organizations') or [''])[0][:25]
             phone   = ''
             if c.get('phones'):
-                # Strip "Phone: " prefix and type label for compact display
-                raw = c['phones'][0]
-                phone = raw[len('Phone: '):].split(' (')[0][:20]
+                phone = c['phones'][0]['value'][:20]
             marker = '?' if orig_idx in fuzzy_idx else ' '
             print(f"  {num:<5}{marker} {name:<30}  {org:<25}  {phone}")
         print()
@@ -1977,7 +2227,7 @@ def run_paged_preview(contacts, fuzzy_pairs=None):
                 (i, c) for i, c in active
                 if q in (c.get('name') or '').lower()
                 or q in ' '.join(c.get('organizations') or []).lower()
-                or any(q in p.lower() for p in c.get('phones', []))
+                or any(q in p['value'].lower() for p in c.get('phones', []))
             ]
         else:
             visible = active
@@ -2127,7 +2377,7 @@ def run_textual_preview(contacts, fuzzy_pairs=None):
                     (i, c) for i, c in result
                     if q in (c.get('name') or '').lower()
                     or q in ' '.join(c.get('organizations') or []).lower()
-                    or any(q in p.lower() for p in c.get('phones', []))
+                    or any(q in p['value'].lower() for p in c.get('phones', []))
                 ]
             if self._sort_mode == 1:
                 result = sorted(result, key=lambda x: (not bool(x[1].get('name')), (x[1].get('name') or '').lower()))
@@ -2362,7 +2612,7 @@ def run_preview(contacts, fuzzy_warnings=None):
 # Converter
 # ---------------------------------------------------------------------------
 
-def convert(input_files, output_file, single_mode=False, sort_contacts=False, stats_only=False, encoding=None, sort_by=None, reverse=False, limit=None, filters=None, select=None, exclude=None, output_format='text', no_photos=False):
+def convert(input_files, output_file, single_mode=False, sort_contacts=False, stats_only=False, encoding=None, sort_by=None, reverse=False, limit=None, filters=None, select=None, exclude=None, output_format='text', no_photos=False, quiet=False, dry_run=False, verbose=False, dedup_only=False, template_path=None):
     """
     Parse one or more .vcf files and write all contacts to an output file.
     Auto-renames the output file if it already exists.
@@ -2379,9 +2629,25 @@ def convert(input_files, output_file, single_mode=False, sort_contacts=False, st
                     dedup, filter, select, and limit are format-agnostic.
     no_photos     : if True, PHOTO/LOGO fields are skipped during parsing
                     (faster; also means include_photos=False for JSON).
+    quiet         : v5 utility flag — suppress all terminal output except
+                    errors (errors always print regardless of this flag).
+    dry_run       : v5 utility flag — run the full pipeline and print what
+                    would be written, but skip the actual file write.
+    verbose       : v5 utility flag — print every field-level parsing
+                    decision (skipped fields, per-contact) as it happens,
+                    and expand the duplicate summary to list every merge/
+                    fuzzy pair by name instead of just a count.
+    dedup_only    : v5 utility flag — parse and run duplicate detection
+                    only, print a focused report, write no output file.
+                    Short-circuits before filter/select/limit/sort, since
+                    those don't matter for a duplicate scan.
 
     Order of operations: parse → sort → dedup → filter → select/exclude → limit.
     """
+    def qprint(*args, **kwargs):
+        if not quiet:
+            print(*args, **kwargs)
+
     all_contacts = []
     malformed = 0
     total_found = 0
@@ -2392,7 +2658,7 @@ def convert(input_files, output_file, single_mode=False, sort_contacts=False, st
             print(f"  ! File not found: {path_str}")
             continue
 
-        print(f"  Reading {path.name} ...", end=' ', flush=True)
+        qprint(f"  Reading {path.name} ...", end=' ', flush=True)
 
         try:
             content = read_file(path, encoding=encoding)
@@ -2410,6 +2676,9 @@ def convert(input_files, output_file, single_mode=False, sort_contacts=False, st
             if contact and has_displayable_content(contact):
                 contact['_source'] = path.name
                 file_contacts.append(contact)
+                if verbose and contact.get('_skipped'):
+                    for msg in contact['_skipped']:
+                        print(f"    [verbose] {contact.get('name') or '(Unknown)'}: skipped {msg}")
             else:
                 file_malformed += 1
 
@@ -2421,7 +2690,7 @@ def convert(input_files, output_file, single_mode=False, sort_contacts=False, st
         status = f"{n_contacts} {'contact' if n_contacts == 1 else 'contacts'}"
         if n_malformed:
             status += f", {n_malformed} malformed"
-        print(status)
+        qprint(status)
 
         all_contacts.extend(file_contacts)
 
@@ -2432,6 +2701,27 @@ def convert(input_files, output_file, single_mode=False, sort_contacts=False, st
             print(f"  {m} malformed {'block' if m == 1 else 'blocks'} skipped.")
         return False
 
+    if dedup_only:
+        all_contacts, exact_removed, fuzzy_warnings = classify_duplicates(all_contacts)
+        print(f"\n  {DIVIDER}")
+        print(f"  Dedup scan  :  {total_found} contacts scanned")
+        if exact_removed:
+            n = len(exact_removed)
+            print(f"  Exact       :  {n} {'duplicate' if n == 1 else 'duplicates'} found (would be merged and removed):")
+            for retained_idx, name in exact_removed:
+                print(f"                   - {name} → merges into contact {retained_idx}")
+        else:
+            print("  Exact       :  none found")
+        if fuzzy_warnings:
+            w = len(fuzzy_warnings)
+            print(f"  Fuzzy       :  {w} possible {'duplicate' if w == 1 else 'duplicates'} (same name + shared phone/email):")
+            for i, j, name in fuzzy_warnings:
+                print(f"                   - Contact {i} and Contact {j} ({name})")
+        else:
+            print("  Fuzzy       :  none found")
+        print(f"  {DIVIDER}")
+        return True
+
     # Sort — skip entirely in stats-only mode (order is never shown)
     do_sort = (sort_contacts or sort_by) and not stats_only
     if do_sort:
@@ -2440,7 +2730,11 @@ def convert(input_files, output_file, single_mode=False, sort_contacts=False, st
             if sort_by == 'org':
                 primary = (c.get('organizations') or [''])[0].lower()
             elif sort_by == 'birthday':
-                primary = (c.get('birthday') or '').lower()
+                # D2 fix: sort on the raw chronological key, not the display
+                # string — "April 12, 1985" sorted alphabetically put every
+                # April-born contact before every January-born one,
+                # regardless of year. _birthday_raw sorts correctly.
+                primary = c.get('_birthday_raw') or ''
             elif sort_by == 'created':
                 primary = (c.get('_created_raw') or '').lower()
             else:  # 'name' or default --sort
@@ -2514,7 +2808,19 @@ def convert(input_files, output_file, single_mode=False, sort_contacts=False, st
         contacts_parts.append("exclusion applied")
     if limited:
         contacts_parts.append(f"limited to {limit}")
-    contacts_parts.append(f"{len(all_contacts)} exported")
+    # Word choice matches what actually happens in each mode — "exported"
+    # is only accurate when a file is genuinely written. Found in a
+    # pre-release wording review: this line was previously always
+    # "exported" regardless of mode, which was simply wrong for --stats
+    # (never writes) and misleadingly stated-as-fact for --dry-run
+    # (explicitly a "what would happen" preview, not a completed action).
+    if stats_only:
+        export_word = "kept"
+    elif dry_run:
+        export_word = "would be exported"
+    else:
+        export_word = "exported"
+    contacts_parts.append(f"{len(all_contacts)} {export_word}")
     contacts_line = ', '.join(contacts_parts)
 
     # Stats-only mode: print summary and exit without writing a file
@@ -2549,7 +2855,7 @@ def convert(input_files, output_file, single_mode=False, sort_contacts=False, st
 
     out_path = safe_output_path(output_file)
     if out_path != Path(output_file):
-        print(f"\n  '{Path(output_file).name}' already exists — saving as '{out_path.name}'")
+        qprint(f"\n  '{Path(output_file).name}' already exists — saving as '{out_path.name}'")
 
     # Build source line
     if single_mode:
@@ -2644,80 +2950,116 @@ def convert(input_files, output_file, single_mode=False, sort_contacts=False, st
     # Format dispatch. Most formatters return a string written via write_text;
     # 'sqlite', 'pdf', and 'docx' write the file themselves (binary / library-
     # owned save), so those three are handled as a direct call instead.
+    # dry_run (v5 utility flag): skip this block entirely — everything above
+    # (parse/sort/dedup/filter/select/limit) still ran for real, so counts in
+    # the summary below are accurate; only the actual file write is skipped.
     include_photos = not no_photos
-    try:
-        if output_format == 'text':
-            out_path.write_text(
-                _render_text(all_contacts, header_rows, single_mode, malformed, exact_removed, fuzzy_warnings),
-                encoding='utf-8')
-        elif output_format == 'json':
-            out_path.write_text(format_json(all_contacts, meta, include_photos=include_photos), encoding='utf-8')
-        elif output_format == 'csv':
-            out_path.write_text(format_csv(all_contacts), encoding='utf-8')
-        elif output_format in ('markdown', 'md'):
-            out_path.write_text(format_markdown(all_contacts, header_rows, single_mode), encoding='utf-8')
-        elif output_format == 'html':
-            out_path.write_text(
-                format_html(all_contacts, header_rows, single_mode, include_photos=include_photos),
-                encoding='utf-8')
-        elif output_format == 'ics':
-            ics_text, ics_skipped = format_ics(all_contacts)
-            out_path.write_text(ics_text, encoding='utf-8')
-            if ics_skipped:
-                print(f"  ! {ics_skipped} birthday/anniversary date(s) had no day-level precision — skipped in the calendar")
-        elif output_format == 'sql':
-            out_path.write_text(format_sql(all_contacts), encoding='utf-8')
-        elif output_format == 'sqlite':
-            write_sqlite(all_contacts, out_path)
-        elif output_format == 'xml':
-            out_path.write_text(format_xml(all_contacts, meta, include_photos=include_photos), encoding='utf-8')
-        elif output_format == 'pdf':
-            write_pdf(all_contacts, header_rows, single_mode, out_path, include_photos=include_photos)
-        elif output_format == 'docx':
-            write_docx(all_contacts, header_rows, single_mode, out_path, include_photos=include_photos)
-    except OSError as e:
-        print(f"\n  ! Could not write output file: {e}")
-        return False
-    except ImportError as e:
-        print(f"\n  ! {e}")
-        return False
+    if not dry_run:
+        try:
+            if output_format == 'text':
+                out_path.write_text(
+                    _render_text(all_contacts, header_rows, single_mode, malformed, exact_removed, fuzzy_warnings),
+                    encoding='utf-8')
+            elif output_format == 'json':
+                out_path.write_text(format_json(all_contacts, meta, include_photos=include_photos), encoding='utf-8')
+            elif output_format == 'csv':
+                out_path.write_text(format_csv(all_contacts), encoding='utf-8')
+            elif output_format in ('markdown', 'md'):
+                out_path.write_text(format_markdown(all_contacts, header_rows, single_mode), encoding='utf-8')
+            elif output_format == 'html':
+                out_path.write_text(
+                    format_html(all_contacts, header_rows, single_mode, include_photos=include_photos),
+                    encoding='utf-8')
+            elif output_format == 'ics':
+                ics_text, ics_skipped = format_ics(all_contacts)
+                out_path.write_text(ics_text, encoding='utf-8')
+                if ics_skipped:
+                    print(f"  ! {ics_skipped} birthday/anniversary date(s) skipped in the calendar (no day-level precision, or not a valid calendar date)")
+            elif output_format == 'sql':
+                out_path.write_text(format_sql(all_contacts), encoding='utf-8')
+            elif output_format == 'sqlite':
+                write_sqlite(all_contacts, out_path)
+            elif output_format == 'xml':
+                out_path.write_text(format_xml(all_contacts, meta, include_photos=include_photos), encoding='utf-8')
+            elif output_format == 'pdf':
+                write_pdf(all_contacts, header_rows, single_mode, out_path, include_photos=include_photos)
+            elif output_format == 'docx':
+                write_docx(all_contacts, header_rows, single_mode, out_path, include_photos=include_photos)
+            elif output_format == 'template':
+                out_path.write_text(format_template(all_contacts, template_path), encoding='utf-8')
+        except OSError as e:
+            print(f"\n  ! Could not write output file: {e}")
+            return False
+        except ImportError as e:
+            print(f"\n  ! {e}")
+            return False
+        except ValueError as e:
+            print(f"\n  ! {e}")
+            return False
 
     # Terminal summary
-    print(f"\n  {DIVIDER}")
-    print(f"  Contacts    :  {contacts_line}")
-    if versions_found:
-        print(f"  vCard       :  {', '.join(versions_found)}")
-    if encoding:
-        print(f"  Encoding    :  {encoding} (manual override)")
-    if total_skipped_fields:
-        fields_str   = f"{total_skipped_fields} {'field' if total_skipped_fields == 1 else 'fields'}"
-        contacts_str = f"{contacts_with_skips} {'contact' if contacts_with_skips == 1 else 'contacts'}"
-        print(f"  Skipped     :  {fields_str} across {contacts_str}")
-    if fuzzy_warnings:
-        w = len(fuzzy_warnings)
-        print(f"  Warnings    :  {w} duplicate {'warning' if w == 1 else 'warnings'} — review output file")
-    if do_sort:
-        sort_label = sort_by or 'name'
-        direction  = 'Z → A' if reverse else 'A → Z'
-        print(f"  Sorted      :  {sort_label} {direction}")
-    if filters:
-        print(f"  Filter      :  {', '.join(filters)}")
-    if selected_expr:
-        print(f"  Select      :  {selected_expr}")
-    if excluded_expr:
-        print(f"  Exclude     :  {excluded_expr}")
-    if limited:
-        print(f"  Limit       :  {limit} contacts")
-    print(f"  Output      :  {out_path}")
-    print(f"  {DIVIDER}")
+    if not quiet:
+        print(f"\n  {DIVIDER}")
+        if dry_run:
+            print("  [DRY RUN]   :  no files were written")
+        print(f"  Contacts    :  {contacts_line}")
+        if versions_found:
+            print(f"  vCard       :  {', '.join(versions_found)}")
+        if encoding:
+            print(f"  Encoding    :  {encoding} (manual override)")
+        if total_skipped_fields:
+            fields_str   = f"{total_skipped_fields} {'field' if total_skipped_fields == 1 else 'fields'}"
+            contacts_str = f"{contacts_with_skips} {'contact' if contacts_with_skips == 1 else 'contacts'}"
+            print(f"  Skipped     :  {fields_str} across {contacts_str}")
+        if fuzzy_warnings:
+            w = len(fuzzy_warnings)
+            if dry_run:
+                # No output file exists to review in dry-run mode — same
+                # wording --stats already correctly uses for this line.
+                print(f"  Warnings    :  {w} duplicate {'warning' if w == 1 else 'warnings'}")
+            else:
+                print(f"  Warnings    :  {w} duplicate {'warning' if w == 1 else 'warnings'} — review output file")
+            if verbose:
+                for i, j, name in fuzzy_warnings:
+                    print(f"                   - Contact {i} and Contact {j} ({name})")
+        if verbose and exact_removed:
+            print(f"  Merged      :  {len(exact_removed)} exact {'duplicate' if len(exact_removed) == 1 else 'duplicates'}:")
+            for retained_idx, name in exact_removed:
+                print(f"                   - {name} → merged into contact {retained_idx}")
+        if do_sort:
+            sort_label = sort_by or 'name'
+            direction  = 'Z → A' if reverse else 'A → Z'
+            print(f"  Sorted      :  {sort_label} {direction}")
+        if filters:
+            print(f"  Filter      :  {', '.join(filters)}")
+        if selected_expr:
+            print(f"  Select      :  {selected_expr}")
+        if excluded_expr:
+            print(f"  Exclude     :  {excluded_expr}")
+        if limited:
+            print(f"  Limit       :  {limit} contacts")
+        print(f"  Output      :  {'[would write to] ' if dry_run else ''}{out_path}")
+        print(f"  {DIVIDER}")
 
     return True
 
 
 def _load_contacts(input_files, encoding=None):
     """
-    Shared file-reading logic for convert_merge() and convert_split().
-    Returns (all_contacts, total_found, malformed).
+    Shared file-reading logic — parses .vcf files into contact dicts,
+    with no dedup/sort/write. Used by every write-mode/report that isn't
+    the main convert() pipeline: _write_merged_vcf() (backing both
+    convert_merge() and convert_to_version()), convert_split(), run_diff(),
+    run_update(), and the --preview dispatch in main().
+
+    Returns (all_contacts, total_found, malformed). Note the None
+    contract: this only returns None (for all_contacts) on an encoding
+    failure (bad --encoding value) — a missing input file just prints a
+    warning and is skipped, not treated as fatal. That's correct for
+    multi-file callers (merge/split can tolerate one missing file among
+    several), but callers taking exactly two files where either missing
+    is unambiguously fatal (run_diff(), run_update()) check file
+    existence explicitly before calling this — see those functions.
     """
     all_contacts = []
     malformed = 0
@@ -2766,10 +3108,33 @@ def _load_contacts(input_files, encoding=None):
 
 def convert_merge(input_files, output_file, encoding=None):
     """
-    Merge one or more .vcf files into a single clean .vcf output.
+    Merge one or more .vcf files into a single clean .vcf output (vCard 3.0).
+    Thin wrapper around _write_merged_vcf() — see that function for the
+    shared implementation used by both --merge and --convert-to.
+    """
+    return _write_merged_vcf(input_files, output_file, target_version='3.0', encoding=encoding)
+
+
+def convert_to_version(input_files, output_file, target_version, encoding=None):
+    """
+    Merge one or more .vcf files into a single clean .vcf output at a
+    specific target vCard version (--convert-to 3.0 / --convert-to 4.0).
+    Same pipeline as --merge (parse -> dedup -> write), just with the
+    version passed through to format_vcf() instead of hardcoded 3.0.
+    See CONTEXT.md ("v5 — Version converter") for the documented 3.0<->4.0
+    differences this applies: tel:/mailto: URI prefixes, and yearless
+    BDAY/ANNIVERSARY handling (representable in 4.0 as --MMDD, not in 3.0).
+    """
+    return _write_merged_vcf(input_files, output_file, target_version=target_version, encoding=encoding)
+
+
+def _write_merged_vcf(input_files, output_file, target_version, encoding=None):
+    """
+    Shared implementation for convert_merge() and convert_to_version().
     Runs full duplicate detection — exact duplicates merged and removed,
-    fuzzy duplicates kept with a warning printed to terminal.
-    Output is always vCard 3.0.
+    fuzzy duplicates kept with a warning printed to terminal. Any BDAY/
+    ANNIVERSARY that couldn't be represented in target_version (see
+    format_vcf()) is skipped and reported here rather than silently lost.
     """
     all_contacts, total_found, malformed = _load_contacts(input_files, encoding=encoding)
 
@@ -2789,7 +3154,9 @@ def convert_merge(input_files, output_file, encoding=None):
     if out_path != Path(output_file):
         print(f"\n  '{Path(output_file).name}' already exists — saving as '{out_path.name}'")
 
-    blocks = [format_vcf(c) for c in all_contacts]
+    results = [format_vcf(c, target_version=target_version) for c in all_contacts]
+    blocks = [b for b, _ in results]
+    skipped_dates = [msg for _, skips in results for msg in skips]
     try:
         out_path.write_text('\n\n'.join(blocks) + '\n', encoding='utf-8')
     except OSError as e:
@@ -2807,6 +3174,7 @@ def convert_merge(input_files, output_file, encoding=None):
     contacts_line = ', '.join(contacts_parts)
 
     print(f"\n  {DIVIDER}")
+    print(f"  Target      :  vCard {target_version}")
     print(f"  Contacts    :  {contacts_line}")
     if exact_removed:
         for retained_idx, name in exact_removed:
@@ -2816,6 +3184,11 @@ def convert_merge(input_files, output_file, encoding=None):
         print(f"  Warnings    :  {w} possible {'duplicate' if w == 1 else 'duplicates'} — same name + shared phone/email")
         for i, j, name in fuzzy_warnings:
             print(f"                   - Contact {i} and Contact {j} ({name})")
+    if skipped_dates:
+        d = len(skipped_dates)
+        print(f"  Dates       :  {d} {'field' if d == 1 else 'fields'} skipped (no year, not representable in vCard {target_version})")
+        for msg in skipped_dates:
+            print(f"                   - {msg}")
     if encoding:
         print(f"  Encoding    :  {encoding} (manual override)")
     print(f"  Output      :  {out_path}")
@@ -2855,11 +3228,14 @@ def convert_split(input_files, output_dir, encoding=None):
 
     width = len(str(len(all_contacts)))  # zero-pad width based on total count
     written = 0
+    skipped_dates = []
     for i, contact in enumerate(all_contacts, 1):
         filename = f"contact_{str(i).zfill(width)}.vcf"
         out_path = out_dir / filename
+        text, skips = format_vcf(contact)
+        skipped_dates.extend(skips)
         try:
-            out_path.write_text(format_vcf(contact) + '\n', encoding='utf-8')
+            out_path.write_text(text + '\n', encoding='utf-8')
             written += 1
         except OSError as e:
             print(f"  ! Could not write {filename}: {e}")
@@ -2884,11 +3260,359 @@ def convert_split(input_files, output_dir, encoding=None):
         print(f"  Warnings    :  {w} possible {'duplicate' if w == 1 else 'duplicates'} — same name + shared phone/email")
         for i, j, name in fuzzy_warnings:
             print(f"                   - Contact {i} and Contact {j} ({name})")
+    if skipped_dates:
+        d = len(skipped_dates)
+        print(f"  Dates       :  {d} {'field' if d == 1 else 'fields'} skipped (no year, not representable in vCard 3.0)")
+        for msg in skipped_dates:
+            print(f"                   - {msg}")
     if encoding:
         print(f"  Encoding    :  {encoding} (manual override)")
     print(f"  Output      :  {written} files in {out_dir}/")
     print(f"  {DIVIDER}")
 
+    return True
+
+
+def run_diff(file1, file2, encoding=None):
+    """
+    v5 utility: --diff file1.vcf file2.vcf. Reports added/removed/changed
+    contacts between two vCard exports — field-level detail for changed
+    contacts, not just presence/absence. No output file is written; this
+    is a terminal report, same family as --stats/--dedup-only.
+
+    Contacts are matched across the two files by name (case-insensitive),
+    not by identity_key() — identity_key() includes phones/emails, and a
+    changed phone number for the same person is exactly the kind of thing
+    a diff should surface as "changed," not as one contact removed plus a
+    different one added. Each file is deduplicated independently first
+    (classify_duplicates()) so within-file duplicates don't produce noise
+    in the comparison. Contacts with no name on either side can't be
+    matched by name at all — reported as plain added/removed.
+    """
+    # _load_contacts() only returns None on an encoding failure, not a
+    # missing file — correct for --merge/--split (many files, a missing
+    # one shouldn't block merging the rest), wrong here: --diff always
+    # takes exactly two files and either missing one is unambiguously
+    # fatal to a meaningful comparison. Checked explicitly, before
+    # _load_contacts() even runs, so the error is immediate and clear
+    # rather than "File not found" plus a silently misleading report
+    # treating the missing file as having zero contacts (found in a
+    # pre-release audit pass — see CONTEXT.md/CHANGELOG.md).
+    missing = [f for f in (file1, file2) if not Path(f).exists()]
+    if missing:
+        for f in missing:
+            print(f"Error: File not found: {f}")
+        return False
+
+    contacts1, _, malformed1 = _load_contacts([file1], encoding=encoding)
+    contacts2, _, malformed2 = _load_contacts([file2], encoding=encoding)
+    if contacts1 is None or contacts2 is None:
+        return False
+
+    contacts1, _, _ = classify_duplicates(contacts1)
+    contacts2, _, _ = classify_duplicates(contacts2)
+
+    def by_name(contacts):
+        named, unnamed = {}, []
+        for c in contacts:
+            name = (c.get('name') or '').strip().lower()
+            if name:
+                named[name] = c
+            else:
+                unnamed.append(c)
+        return named, unnamed
+
+    map1, unnamed1 = by_name(contacts1)
+    map2, unnamed2 = by_name(contacts2)
+
+    added_names   = sorted(set(map2) - set(map1))
+    removed_names = sorted(set(map1) - set(map2))
+    common_names  = sorted(set(map1) & set(map2))
+
+    # Fields compared for "changed" — same field set identity_key() would
+    # use for phones/emails/addresses/organizations, plus every other
+    # meaningful contact field. Multi-value fields sorted before comparing
+    # so reordering the same values in the source file isn't reported as
+    # a change.
+    diff_fields = [
+        ('phones',        lambda c: sorted(p['value'] for p in c.get('phones', []))),
+        ('emails',        lambda c: sorted(e['value'] for e in c.get('emails', []))),
+        ('addresses',     lambda c: sorted(c.get('addresses', []))),
+        ('organizations', lambda c: sorted(c.get('organizations', []))),
+        ('title',         lambda c: c.get('title') or ''),
+        ('birthday',      lambda c: c.get('birthday') or ''),
+        ('urls',          lambda c: sorted(c.get('urls', []))),
+        ('notes',         lambda c: sorted(c.get('notes', []))),
+        ('nickname',      lambda c: c.get('nickname') or ''),
+        ('anniversary',   lambda c: c.get('anniversary') or ''),
+        ('gender',        lambda c: c.get('gender') or ''),
+        ('categories',    lambda c: c.get('categories') or ''),
+    ]
+
+    changed = []
+    for name in common_names:
+        c1, c2 = map1[name], map2[name]
+        field_changes = [
+            (field, extract(c1), extract(c2))
+            for field, extract in diff_fields
+            if extract(c1) != extract(c2)
+        ]
+        if field_changes:
+            changed.append((name, field_changes))
+
+    print(f"\n  {DIVIDER}")
+    print(f"  Diff        :  {Path(file1).name} → {Path(file2).name}")
+    if malformed1 or malformed2:
+        print(f"  Malformed   :  {malformed1} in {Path(file1).name}, {malformed2} in {Path(file2).name} (excluded from comparison)")
+    print(f"  Added       :  {len(added_names) + len(unnamed2)}")
+    for name in added_names:
+        print(f"                   + {map2[name].get('name')}")
+    print(f"  Removed     :  {len(removed_names) + len(unnamed1)}")
+    for name in removed_names:
+        print(f"                   - {map1[name].get('name')}")
+    print(f"  Changed     :  {len(changed)}")
+    for name, field_changes in changed:
+        print(f"                   ~ {map1[name].get('name')}")
+        for field, v1, v2 in field_changes:
+            print(f"                       {field}: {v1} → {v2}")
+    print(f"  Unchanged   :  {len(common_names) - len(changed)}")
+    print(f"  {DIVIDER}")
+    return True
+
+
+def run_update(base_file, new_file, output_file, encoding=None):
+    """
+    v5 utility: --update base.vcf new.vcf. Absorbs new.vcf into base.vcf —
+    new.vcf wins unconditionally for identity fields (phones, emails,
+    addresses, organizations, birthday), since the whole point of "update"
+    is treating new.vcf as the fresher, authoritative export. Non-identity
+    fields (title, nickname, notes, custom fields, etc.) are rescued from
+    base.vcf when new.vcf is missing them, rather than lost outright — that
+    "rescue what the other side has, but this side wins on conflict" logic
+    is exactly what merge_contacts() already does when called with the
+    winning contact as `base` and the losing one as `duplicate`, so this
+    reuses that function directly instead of writing new merge logic.
+    One gap in that reuse: merge_contacts() doesn't rescue `birthday`,
+    since it assumes identity fields already match between true duplicates
+    — not true here, so birthday is rescued explicitly in the loop below
+    when new.vcf's contact lacks one but base.vcf's has one.
+
+    Contacts are matched by name (case-insensitive) — same reasoning as
+    run_diff(): identity fields are allowed to differ between base and new
+    for the same person (that's the update), so identity_key() can't be
+    used for matching here. A base contact with no match in new.vcf is
+    kept as-is (not touched by the update). A new contact with no match in
+    base.vcf is added. Contacts with no name on either side pass through
+    unmatched, same as run_diff()'s unnamed handling.
+
+    Each file is deduplicated independently before matching, so within-
+    file duplicates already got merged/cleaned before the cross-file update
+    logic runs. Output is always a single valid VCF (vCard 3.0, matching
+    --merge's default) via format_vcf() — --update produces a real,
+    importable file, not a report like --diff.
+    """
+    # Same missing-file gap fixed in run_diff() (see that function's
+    # comment) — checked explicitly before _load_contacts() runs, since a
+    # missing base.vcf or new.vcf is unambiguously fatal to a meaningful
+    # update, not something to silently treat as zero contacts.
+    missing = [f for f in (base_file, new_file) if not Path(f).exists()]
+    if missing:
+        for f in missing:
+            print(f"Error: File not found: {f}")
+        return False
+
+    base_contacts, _, malformed_base = _load_contacts([base_file], encoding=encoding)
+    new_contacts, _, malformed_new = _load_contacts([new_file], encoding=encoding)
+    if base_contacts is None or new_contacts is None:
+        return False
+
+    base_contacts, _, _ = classify_duplicates(base_contacts)
+    new_contacts, _, _ = classify_duplicates(new_contacts)
+
+    def by_name(contacts):
+        named, unnamed = {}, []
+        for c in contacts:
+            name = (c.get('name') or '').strip().lower()
+            if name:
+                named[name] = c
+            else:
+                unnamed.append(c)
+        return named, unnamed
+
+    base_map, base_unnamed = by_name(base_contacts)
+    new_map, new_unnamed = by_name(new_contacts)
+
+    updated_count = 0
+    added_count = 0
+    unchanged_count = 0
+    result = []
+
+    for name, new_c in new_map.items():
+        if name in base_map:
+            merged = merge_contacts(new_c, base_map[name])
+            # merge_contacts() assumes identity fields (birthday included)
+            # already match between the two contacts, since it's built for
+            # true duplicates — not true here, where new.vcf legitimately
+            # may have re-exported without a birthday. Rescue it explicitly
+            # rather than letting it silently vanish when new.vcf lacks it.
+            if not merged.get('birthday') and base_map[name].get('birthday'):
+                merged['birthday'] = base_map[name]['birthday']
+                # Carry the companion raw sort key along with it (D2 fix) —
+                # otherwise the rescued birthday would have no matching
+                # _birthday_raw, silently breaking --sort-by birthday/ICS/
+                # --convert-to for this specific contact.
+                if base_map[name].get('_birthday_raw'):
+                    merged['_birthday_raw'] = base_map[name]['_birthday_raw']
+            result.append(merged)
+            updated_count += 1
+        else:
+            result.append(new_c)
+            added_count += 1
+    for name, base_c in base_map.items():
+        if name not in new_map:
+            result.append(base_c)
+            unchanged_count += 1
+    result.extend(new_unnamed)
+    result.extend(base_unnamed)
+
+    out_path = safe_output_path(output_file)
+    if out_path != Path(output_file):
+        print(f"\n  '{Path(output_file).name}' already exists — saving as '{out_path.name}'")
+
+    write_results = [format_vcf(c) for c in result]
+    blocks = [b for b, _ in write_results]
+    skipped_dates = [msg for _, skips in write_results for msg in skips]
+    try:
+        out_path.write_text('\n\n'.join(blocks) + '\n', encoding='utf-8')
+    except OSError as e:
+        print(f"\n  ! Could not write output file: {e}")
+        return False
+
+    print(f"\n  {DIVIDER}")
+    print(f"  Update      :  {Path(base_file).name} + {Path(new_file).name}")
+    if malformed_base or malformed_new:
+        print(f"  Malformed   :  {malformed_base} in {Path(base_file).name}, {malformed_new} in {Path(new_file).name} (excluded from update)")
+    print(f"  Updated     :  {updated_count} (matched by name, new.vcf's data wins)")
+    print(f"  Added       :  {added_count + len(new_unnamed)} (new to new.vcf)")
+    print(f"  Unchanged   :  {unchanged_count + len(base_unnamed)} (only in base.vcf, kept as-is)")
+    if skipped_dates:
+        d = len(skipped_dates)
+        print(f"  Dates       :  {d} {'field' if d == 1 else 'fields'} skipped (no year, not representable in vCard 3.0)")
+    print(f"  Output      :  {out_path}")
+    print(f"  {DIVIDER}")
+    return True
+
+
+def run_watch(folder_path, output_format='text', encoding=None, interval=5):
+    """
+    v5 utility: --watch /folder. Foreground polling loop — no external
+    watchdog dependency, matching the zero-required-dependency rule. Polls
+    the folder every `interval` seconds; any .vcf file that's new or whose
+    mtime has changed since the last poll gets auto-converted via the
+    normal convert() pipeline (default settings: no sort/filter/select,
+    smart output filename, same as running the script on that file
+    directly with no flags other than --format). Runs until Ctrl+C.
+
+    This is a simple, blocking, single-process loop — not a background
+    daemon. Good enough for "drop files in this folder and get them
+    auto-converted while I'm working," not intended for unattended
+    server-style operation.
+    """
+    folder = Path(folder_path)
+    if not folder.is_dir():
+        print(f"Error: --watch folder not found or not a directory: {folder_path}")
+        return False
+
+    print(f"\n  Watching {folder}/ for .vcf files (format: {output_format}, every {interval}s)")
+    print("  Press Ctrl+C to stop.\n")
+
+    known_mtimes = {}
+    try:
+        while True:
+            for vcf_path in sorted(folder.glob('*.vcf')):
+                mtime = vcf_path.stat().st_mtime
+                if known_mtimes.get(vcf_path) != mtime:
+                    known_mtimes[vcf_path] = mtime
+                    ext = FORMAT_EXTENSIONS.get(output_format, 'txt')
+                    out_file = str(vcf_path.with_suffix(f'.{ext}'))
+                    print(f"  [{datetime.now().strftime('%H:%M:%S')}] Detected {vcf_path.name} — converting...")
+                    convert([str(vcf_path)], out_file, single_mode=True,
+                             output_format=output_format, encoding=encoding, quiet=True)
+                    print(f"  [{datetime.now().strftime('%H:%M:%S')}] → {out_file}")
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\n  Stopped watching.")
+        return True
+
+
+def run_validate(input_files, encoding=None):
+    """
+    v5 utility: --validate. Deep per-contact validation report, no output
+    file written — same terminal-report family as --dedup-only/--diff.
+
+    Unlike --stats (which reports counts after the full dedup pipeline),
+    --validate runs parsing only, no duplicate detection, and surfaces
+    every field-level validation failure per contact by name (not just an
+    aggregate count) — the "deep" in "deep validation report." Reuses the
+    same _skipped tracking parse_vcard() already builds for every field
+    handler's try/except (TEL/EMAIL/BDAY validation, empty-value guards,
+    etc.) rather than adding a second parallel validation pass; the value
+    --validate adds over --stats/--verbose is presentation (grouped as a
+    dedicated report) and no dedup/sort/write side effects, not new checks.
+    """
+    all_contacts = []
+    malformed_details = []
+    versions_found = set()
+
+    for path_str in input_files:
+        path = Path(path_str)
+        if not path.exists():
+            print(f"  ! File not found: {path_str}")
+            continue
+
+        try:
+            content = read_file(path, encoding=encoding)
+        except ValueError as e:
+            print(f"  ! {e}")
+            continue
+
+        blocks = re.split(r'END:VCARD\s*', content, flags=re.IGNORECASE)
+        blocks = [b + 'END:VCARD' for b in blocks if re.search(r'BEGIN:VCARD', b, re.IGNORECASE)]
+
+        for i, block in enumerate(blocks, 1):
+            contact = parse_vcard(block)
+            if contact and has_displayable_content(contact):
+                contact['_source'] = path.name
+                all_contacts.append(contact)
+                if contact.get('_version'):
+                    versions_found.add(contact['_version'])
+            else:
+                malformed_details.append(f"{path.name}, block {i}: no parseable/displayable content")
+
+    if not all_contacts and not malformed_details:
+        print("\n  No contacts found.")
+        return False
+
+    contacts_with_issues = [c for c in all_contacts if c.get('_skipped')]
+    total_issues = sum(len(c.get('_skipped', [])) for c in all_contacts)
+
+    print(f"\n  {DIVIDER}")
+    print(f"  Validate    :  {len(all_contacts)} contacts checked, {len(malformed_details)} malformed")
+    if versions_found:
+        print(f"  vCard       :  {', '.join(sorted(versions_found))}")
+    if malformed_details:
+        print("  Malformed   :")
+        for detail in malformed_details:
+            print(f"                   - {detail}")
+    if contacts_with_issues:
+        print(f"  Issues      :  {total_issues} field validation {'issue' if total_issues == 1 else 'issues'} across {len(contacts_with_issues)} {'contact' if len(contacts_with_issues) == 1 else 'contacts'}:")
+        for c in contacts_with_issues:
+            print(f"                   {c.get('name') or '(Unknown)'}:")
+            for msg in c['_skipped']:
+                print(f"                     ⚠ {msg}")
+    else:
+        print("  Issues      :  none found")
+    print(f"  {DIVIDER}")
     return True
 
 
@@ -2910,8 +3634,10 @@ def main():
         print()
         print("Options:")
         print("  -o <file>              Output file or directory")
-        print("  --format <name>        Output format: text (default), json")
-        print("  --no-photos            Skip decoding PHOTO/LOGO fields (faster; omits them from JSON)")
+        print("  --format <name>        Output format: text (default), json, csv, markdown,")
+        print("                           html, ics, sql, sqlite, xml, pdf, docx, template")
+        print("  --no-photos            Skip decoding PHOTO/LOGO fields (faster; omits them from")
+        print("                           JSON/HTML/XML/PDF/DOCX output)")
         print("  --sort                 Sort contacts A to Z by name")
         print("  --sort-by <field>      Sort by field: name, org, birthday, created")
         print("  --reverse              Reverse sort order (requires --sort or --sort-by)")
@@ -2929,6 +3655,16 @@ def main():
         print("  --browser              With --preview: open a one-shot HTML view in your browser instead")
         print("  --merge                Merge input VCFs into one clean .vcf file")
         print("  --split                Split contacts into individual .vcf files")
+        print("  --convert-to <ver>     Convert to a target vCard version: 3.0 or 4.0")
+        print("  --dedup-only           Scan for duplicates and report, no output file written")
+        print("  --validate             Deep per-contact validation report, no output file written")
+        print("  --diff <f1> <f2>       Compare two .vcf exports: added/removed/changed contacts")
+        print("  --update <base> <new>  Absorb new.vcf into base.vcf (new.vcf wins conflicts)")
+        print("  --template <file>      Render output using a placeholder template file")
+        print("  --watch <folder>       Poll a folder and auto-convert new/changed .vcf files")
+        print("  --quiet                Suppress terminal output except errors (default pipeline only)")
+        print("  --dry-run              Run the full pipeline, print the summary, write nothing")
+        print("  --verbose              Print every field-level parsing/dedup decision (default pipeline only)")
         print("  --encoding <codec>     Force a specific file encoding (e.g. shift-jis, gb2312)")
         print("  --version              Show program version")
         print("  -h, --help             Show this help")
@@ -2949,9 +3685,113 @@ def main():
         print("  python vCardTra.py contacts.vcf --encoding shift-jis")
         print("  python vCardTra.py file1.vcf file2.vcf --merge -o merged.vcf")
         print("  python vCardTra.py contacts.vcf --split -o split_output/")
+        print("  python vCardTra.py contacts.vcf --convert-to 4.0 -o converted.vcf")
+        print("  python vCardTra.py contacts.vcf --dedup-only")
+        print("  python vCardTra.py contacts.vcf --validate")
+        print("  python vCardTra.py old.vcf new.vcf --diff")
+        print("  python vCardTra.py --update base.vcf new_export.vcf -o updated.vcf")
+        print("  python vCardTra.py contacts.vcf --template myformat.txt -o out.txt")
+        print("  python vCardTra.py --watch ./incoming")
+        print("  python vCardTra.py contacts.vcf --dry-run")
         sys.exit(0 if '--help' in sys.argv or '-h' in sys.argv else 1)
 
     args = sys.argv[1:]
+
+    # --diff, --update, and --watch are self-contained v5 utility commands —
+    # handled here, before the main flag-parsing machinery below, since none
+    # of the sort/filter/select/format machinery applies to them. Each exits
+    # directly rather than falling through to the rest of main().
+    if '--diff' in args:
+        idx = args.index('--diff')
+        rest = args[:idx] + args[idx + 1:]
+        diff_encoding = None
+        if '--encoding' in rest:
+            eidx = rest.index('--encoding')
+            if eidx + 1 < len(rest):
+                diff_encoding = rest[eidx + 1]
+                rest = rest[:eidx] + rest[eidx + 2:]
+            else:
+                print("Error: --encoding flag requires a codec name.")
+                sys.exit(1)
+        if len(rest) != 2:
+            print("Error: --diff requires exactly two .vcf files: --diff file1.vcf file2.vcf")
+            sys.exit(1)
+        sys.exit(0 if run_diff(rest[0], rest[1], encoding=diff_encoding) else 1)
+
+    if '--update' in args:
+        idx = args.index('--update')
+        if idx + 2 >= len(args):
+            print("Error: --update requires two files: --update base.vcf new.vcf")
+            sys.exit(1)
+        base_file = args[idx + 1]
+        new_file = args[idx + 2]
+        rest = args[:idx] + args[idx + 3:]
+        update_output = None
+        update_encoding = None
+        if '-o' in rest:
+            oidx = rest.index('-o')
+            if oidx + 1 < len(rest):
+                update_output = rest[oidx + 1]
+                rest = rest[:oidx] + rest[oidx + 2:]
+            else:
+                print("Error: -o flag requires a filename.")
+                sys.exit(1)
+        if '--encoding' in rest:
+            eidx = rest.index('--encoding')
+            if eidx + 1 < len(rest):
+                update_encoding = rest[eidx + 1]
+                rest = rest[:eidx] + rest[eidx + 2:]
+            else:
+                print("Error: --encoding flag requires a codec name.")
+                sys.exit(1)
+        if update_output is None:
+            update_output = f"{Path(base_file).stem}_updated.vcf"
+        sys.exit(0 if run_update(base_file, new_file, update_output, encoding=update_encoding) else 1)
+
+    if '--watch' in args:
+        idx = args.index('--watch')
+        if idx + 1 >= len(args):
+            print("Error: --watch requires a folder path: --watch /path/to/folder")
+            sys.exit(1)
+        watch_folder = args[idx + 1]
+        rest = args[:idx] + args[idx + 2:]
+        watch_format = 'text'
+        watch_encoding = None
+        if '--format' in rest:
+            fidx = rest.index('--format')
+            if fidx + 1 < len(rest):
+                watch_format = rest[fidx + 1].lower()
+                rest = rest[:fidx] + rest[fidx + 2:]
+            else:
+                print("Error: --format requires a format name.")
+                sys.exit(1)
+            if watch_format not in FORMAT_EXTENSIONS or watch_format == 'template':
+                print(f"Error: Unknown or unsupported format '{watch_format}' for --watch.")
+                sys.exit(1)
+            if watch_format in FORMAT_DEPENDENCIES:
+                # Same upfront dependency check the normal --format parsing
+                # does — without this, a missing weasyprint/python-docx
+                # wouldn't surface until the first file is actually
+                # detected and converted, several minutes into a --watch
+                # session, instead of immediately (found in a pre-release
+                # audit pass — see CONTEXT.md/CHANGELOG.md).
+                import importlib.util
+                pkg_import_name = 'weasyprint' if watch_format == 'pdf' else 'docx'
+                if importlib.util.find_spec(pkg_import_name) is None:
+                    dep = FORMAT_DEPENDENCIES[watch_format]
+                    print(f"Error: --format {watch_format} requires the '{dep}' package, which isn't installed.")
+                    print(f"  Install with: pip install {dep}")
+                    sys.exit(1)
+        if '--encoding' in rest:
+            eidx = rest.index('--encoding')
+            if eidx + 1 < len(rest):
+                watch_encoding = rest[eidx + 1]
+                rest = rest[:eidx] + rest[eidx + 2:]
+            else:
+                print("Error: --encoding flag requires a codec name.")
+                sys.exit(1)
+        sys.exit(0 if run_watch(watch_folder, output_format=watch_format, encoding=watch_encoding) else 1)
+
     output_file   = None
     sort_contacts = '--sort' in args
     stats_only    = '--stats' in args
@@ -2961,6 +3801,11 @@ def main():
     do_browser    = '--browser' in args
     reverse       = '--reverse' in args
     no_photos     = '--no-photos' in args
+    quiet         = '--quiet' in args
+    dry_run       = '--dry-run' in args
+    verbose       = '--verbose' in args
+    dedup_only    = '--dedup-only' in args
+    do_validate   = '--validate' in args
     encoding      = None
     sort_by       = None
     limit         = None
@@ -2968,28 +3813,95 @@ def main():
     select        = None
     exclude       = None
     output_format = 'text'
+    convert_to_target = None
 
-    if do_merge and do_split:
-        print("Error: --merge and --split cannot be used together.")
+    if '--convert-to' in args:
+        idx = args.index('--convert-to')
+        if idx + 1 < len(args):
+            convert_to_target = args[idx + 1]
+            args = args[:idx] + args[idx + 2:]
+        else:
+            print("Error: --convert-to requires a target vCard version (3.0 or 4.0).")
+            sys.exit(1)
+        if convert_to_target not in ('3.0', '4.0'):
+            print(f"Error: Unsupported --convert-to target '{convert_to_target}'. Supported: 3.0, 4.0.")
+            sys.exit(1)
+    do_convert = convert_to_target is not None
+
+    template_path = None
+    if '--template' in args:
+        idx = args.index('--template')
+        if idx + 1 < len(args):
+            template_path = args[idx + 1]
+            args = args[:idx] + args[idx + 2:]
+        else:
+            print("Error: --template requires a file path (e.g. --template myformat.txt).")
+            sys.exit(1)
+        try:
+            load_template(template_path)  # validate upfront, same pattern as pdf/docx deps
+        except ValueError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+        output_format = 'template'
+
+    if sum([do_merge, do_split, do_convert]) > 1:
+        print("Error: --merge, --split, and --convert-to cannot be used together.")
         sys.exit(1)
 
-    if do_preview and (do_merge or do_split or stats_only):
-        print("Error: --preview cannot be combined with --merge, --split, or --stats.")
+    if do_preview and (do_merge or do_split or do_convert or stats_only):
+        print("Error: --preview cannot be combined with --merge, --split, --convert-to, or --stats.")
         sys.exit(1)
 
     if do_browser and not do_preview:
         print("Error: --browser requires --preview (it selects the preview's display mode).")
         sys.exit(1)
 
-    args = [a for a in args if a not in ('--sort', '--stats', '--merge', '--split', '--reverse', '--preview', '--no-photos', '--browser')]
+    if dedup_only and (do_merge or do_split or do_convert or do_preview or stats_only or template_path):
+        print("Error: --dedup-only cannot be combined with --merge, --split, --convert-to, --preview, --stats, or --template.")
+        sys.exit(1)
+
+    if do_validate and (do_merge or do_split or do_convert or do_preview or stats_only or dedup_only or template_path):
+        print("Error: --validate cannot be combined with --merge, --split, --convert-to, --preview, --stats, --dedup-only, or --template.")
+        sys.exit(1)
+
+    if dry_run and (do_merge or do_split or do_convert or do_preview or dedup_only or do_validate):
+        print("Error: --dry-run cannot be combined with --merge, --split, --convert-to, --preview, --dedup-only, or --validate.")
+        sys.exit(1)
+
+    if quiet and (dedup_only or do_validate):
+        print("Error: --quiet cannot be combined with --dedup-only or --validate — those flags' whole output is their terminal report.")
+        sys.exit(1)
+
+    # --quiet and --verbose are convert()-only parameters (see CONTEXT.md
+    # D-notes) — _write_merged_vcf()/convert_split() don't accept either,
+    # so silently allowing this combination would mean the flag is a
+    # silent no-op rather than doing what the person asked. Found in a
+    # pre-release audit pass: both flags were previously accepted with
+    # --merge/--split/--convert-to and simply had no effect at all.
+    if quiet and (do_merge or do_split or do_convert):
+        print("Error: --quiet is not yet supported with --merge, --split, or --convert-to (convert() pipeline only).")
+        sys.exit(1)
+
+    if verbose and (do_merge or do_split or do_convert or do_preview or dedup_only or do_validate):
+        print("Error: --verbose is not yet supported with --merge, --split, --convert-to, --preview, --dedup-only, or --validate.")
+        sys.exit(1)
+
+    args = [a for a in args if a not in ('--sort', '--stats', '--merge', '--split', '--reverse', '--preview', '--no-photos', '--browser', '--quiet', '--dry-run', '--verbose', '--dedup-only', '--validate')]
 
     if '--format' in args:
         idx = args.index('--format')
         if idx + 1 < len(args):
-            output_format = args[idx + 1].lower()
+            explicit_format = args[idx + 1].lower()
             args = args[:idx] + args[idx + 2:]
         else:
             print("Error: --format requires a format name (e.g. --format json).")
+            sys.exit(1)
+        if template_path and explicit_format != 'template':
+            print(f"Error: --format {explicit_format} conflicts with --template (which implies --format template).")
+            sys.exit(1)
+        output_format = explicit_format
+        if output_format == 'template' and not template_path:
+            print("Error: --format template requires --template <path> (e.g. --template myformat.txt).")
             sys.exit(1)
         if output_format not in FORMAT_EXTENSIONS:
             if output_format in PLANNED_FORMATS:
@@ -3007,8 +3919,8 @@ def main():
                 print(f"Error: --format {output_format} requires the '{dep}' package, which isn't installed.")
                 print(f"  Install with: pip install {dep}")
                 sys.exit(1)
-        if output_format != 'text' and (do_merge or do_split):
-            print("Error: --format cannot be combined with --merge or --split — those always write valid .vcf files.")
+        if output_format != 'text' and (do_merge or do_split or do_convert):
+            print("Error: --format cannot be combined with --merge, --split, or --convert-to — those always write valid .vcf files.")
             sys.exit(1)
         if output_format != 'text' and do_preview:
             print("Error: --format cannot be combined with --preview — preview always exports a text snapshot.")
@@ -3118,7 +4030,8 @@ def main():
     single_mode = len(input_files) == 1
 
     n = len(input_files)
-    print(f"\nvCardTra — {n} {'file' if n == 1 else 'files'} to process\n")
+    if not quiet:
+        print(f"\nvCardTra — {n} {'file' if n == 1 else 'files'} to process\n")
 
     if do_merge:
         if output_file is None:
@@ -3138,11 +4051,28 @@ def main():
         if not convert_split(input_files, output_file, encoding=encoding):
             sys.exit(1)
 
+    elif do_convert:
+        if output_file is None:
+            names = [Path(f).stem for f in input_files]
+            version_tag = convert_to_target.replace('.', '')
+            if len(names) == 1:
+                output_file = f"{names[0]}_v{version_tag}.vcf"
+            elif len(names) == 2:
+                output_file = f"{names[0]}_{names[1]}_v{version_tag}.vcf"
+            else:
+                output_file = f"{names[0]}_and_{len(names) - 1}_more_v{version_tag}.vcf"
+        if not convert_to_version(input_files, output_file, convert_to_target, encoding=encoding):
+            sys.exit(1)
+
+    elif do_validate:
+        if not run_validate(input_files, encoding=encoding):
+            sys.exit(1)
+
     elif do_preview:
         # Preview: run full parse → dedup → sort → filter → select/exclude pipeline,
         # then hand the resulting contact list to run_preview() instead of writing a file.
         # All sorting/filtering flags work exactly as in normal mode.
-        contacts, total_found, malformed = _load_contacts(input_files, encoding=encoding)
+        contacts, _, malformed = _load_contacts(input_files, encoding=encoding)
         if not contacts:
             if malformed:
                 m = malformed
@@ -3157,7 +4087,9 @@ def main():
                 if sort_by == 'org':
                     primary = (c.get('organizations') or [''])[0].lower()
                 elif sort_by == 'birthday':
-                    primary = (c.get('birthday') or '').lower()
+                    # D2 fix — see the matching comment in convert()'s
+                    # _sort_key() for the full explanation.
+                    primary = c.get('_birthday_raw') or ''
                 elif sort_by == 'created':
                     primary = (c.get('_created_raw') or '').lower()
                 else:
@@ -3169,7 +4101,7 @@ def main():
                 known    = [c for c in contacts if _sort_key(c)[1]]
                 contacts = known[::-1] + unknowns
 
-        contacts, exact_removed, fuzzy_warnings = classify_duplicates(contacts)
+        contacts, _, fuzzy_warnings = classify_duplicates(contacts)
 
         if filters:
             try:
@@ -3219,7 +4151,7 @@ def main():
                     f"{names[0]}_{names[1]}.{ext}" if len(names) == 2
                     else f"{names[0]}_and_{len(names) - 1}_more.{ext}"
                 )
-        if not convert(input_files, output_file, single_mode=single_mode, sort_contacts=sort_contacts, stats_only=stats_only, encoding=encoding, sort_by=sort_by, reverse=reverse, limit=limit, filters=filters, select=select, exclude=exclude, output_format=output_format, no_photos=no_photos):
+        if not convert(input_files, output_file, single_mode=single_mode, sort_contacts=sort_contacts, stats_only=stats_only, encoding=encoding, sort_by=sort_by, reverse=reverse, limit=limit, filters=filters, select=select, exclude=exclude, output_format=output_format, no_photos=no_photos, quiet=quiet, dry_run=dry_run, verbose=verbose, dedup_only=dedup_only, template_path=template_path):
             sys.exit(1)
 
 

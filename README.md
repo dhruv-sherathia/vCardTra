@@ -1,6 +1,10 @@
+<p align="center">
+  <img src="icon.png" width="120" alt="vCardTra">
+</p>
+
 # vCardTra
 
-A Python script that converts vCard (.vcf) files into text, JSON, CSV, Markdown, HTML, ICS, SQL, SQLite, XML, PDF, or DOCX. Works with exports from iPhone, Android, Google Contacts, Apple Contacts, Outlook, WhatsApp, and most other apps that export contacts as `.vcf`.
+A Python script that transforms vCard (.vcf) files into text, JSON, CSV, Markdown, HTML, ICS, SQL, SQLite, XML, PDF, or DOCX. Works with exports from iPhone, Android, Google Contacts, Apple Contacts, Outlook, WhatsApp, and most other apps that export contacts as `.vcf`.
 
 > Renamed from vCard2text at v4.0 — same script, broader output support.
 
@@ -82,6 +86,16 @@ python vCardTra.py <file.vcf> [options]
 | `--browser` | With `--preview`: one-shot HTML view in your browser instead of the terminal UI |
 | `--merge` | Merge all input VCFs into one clean `.vcf` file |
 | `--split` | Split contacts into individual `.vcf` files, one per contact |
+| `--convert-to <version>` | Convert to a target vCard version — `3.0` or `4.0` — and write one merged `.vcf` |
+| `--dedup-only` | Scan for duplicates and print a report — no output file written |
+| `--validate` | Deep per-contact validation report — no output file written |
+| `--diff <file1> <file2>` | Compare two exports: added/removed/changed contacts, field-level detail |
+| `--update <base> <new>` | Absorb `new.vcf` into `base.vcf` — `new.vcf` wins conflicts, non-identity fields rescued from `base.vcf` |
+| `--template <file>` | Render output using your own `{token}` placeholder template |
+| `--watch <folder>` | Poll a folder and auto-convert new/changed `.vcf` files until `Ctrl+C` |
+| `--quiet` | Suppress terminal output except errors |
+| `--dry-run` | Run the full pipeline and print the summary, but write nothing |
+| `--verbose` | Print every field-level parsing/dedup decision as it happens |
 | `--encoding <codec>` | Force a specific file encoding (e.g. `shift-jis`, `gb2312`) |
 | `--version` | Show version and exit |
 | `-h, --help` | Show help |
@@ -175,6 +189,11 @@ python vCardTra.py iphone.vcf google.vcf --merge -o all_contacts.vcf
 Split into individual per-contact files:
 ```bash
 python vCardTra.py contacts.vcf --split -o my_split/
+```
+
+Convert to a different vCard version:
+```bash
+python vCardTra.py old_contacts.vcf --convert-to 4.0 -o modern.vcf
 ```
 
 Force a specific file encoding:
@@ -282,7 +301,70 @@ Produces a single clean `.vcf` file in vCard 3.0 format with all contacts dedupl
 
 Splits contacts into individual `.vcf` files written into a directory. Files are zero-padded and numbered: `contact_01.vcf`, `contact_02.vcf`, etc. Deduplication runs before splitting so the output set is clean. Default output directory: `split_<input_stem>/` (e.g. `split_contacts/`).
 
-### Output Formats
+### --convert-to output
+
+Converts input at any vCard version to a target version and writes one clean, deduplicated `.vcf` file — like `--merge`, but at your chosen version instead of always 3.0. Supported targets: `3.0` and `4.0`.
+
+```bash
+python vCardTra.py contacts.vcf --convert-to 4.0 -o converted.vcf
+```
+
+Default output name follows the `--merge` pattern with a version suffix: `contacts_v40.vcf` (single input), `work_personal_v40.vcf` (two inputs), `work_and_2_more_v40.vcf` (three or more).
+
+What actually changes between the two targets:
+- **TEL/EMAIL** — a `4.0` target adds `tel:`/`mailto:` URI prefixes (`TEL:tel:+1-555-0101`); a `3.0` target doesn't
+- **BDAY/ANNIVERSARY** — a birthday with no year (e.g. one originally parsed from a 4.0-source `--MMDD` value) converts to `--0704`-style syntax for a `4.0` target, since 4.0 supports year-less dates. A `3.0` target has no valid way to represent a yearless date, so that field is skipped for that contact — reported in the terminal summary (`Dates: N fields skipped...`) rather than silently dropped or written incorrectly
+
+`2.1` is not offered as a `--convert-to` target. A correct 2.1 writer needs its own serialization (bare type params, `QUOTED-PRINTABLE` encoding for non-ASCII text), and a subtle encoding bug would garble accented names silently on exactly the old devices that need 2.1. 2.1 files are still fully supported as *input*.
+
+### Utility flags
+
+Terminal-report flags — no output file is written, these just print to the terminal:
+
+```bash
+python vCardTra.py contacts.vcf --dedup-only     # duplicate scan only
+python vCardTra.py contacts.vcf --validate       # per-contact field validation report
+python vCardTra.py contacts.vcf --dry-run        # run the full pipeline, print the summary, write nothing
+python vCardTra.py old.vcf new.vcf --diff        # added/removed/changed contacts, field-level detail
+```
+
+`--diff` matches contacts between the two files by name (not the identity fields used elsewhere for duplicate detection) — a changed phone number for the same person is reported as one *changed* contact, not one removed plus a different one added.
+
+**`--update <base.vcf> <new.vcf>`** absorbs `new.vcf` into `base.vcf` and writes a merged `.vcf` file:
+
+```bash
+python vCardTra.py --update contacts_old.vcf contacts_export.vcf -o updated.vcf
+```
+
+`new.vcf` wins unconditionally on phones/emails/addresses/organizations/birthday for any contact matched by name in both files — it's treated as the fresher, authoritative export. Anything `new.vcf` is missing for a matched contact (title, notes, custom fields, etc.) is rescued from `base.vcf` rather than lost. Contacts only in `base.vcf` are kept as-is; contacts only in `new.vcf` are added.
+
+**`--template <file>`** renders your own flat text format using `{token}` placeholders instead of the built-in text/Markdown/etc. layouts:
+
+```bash
+python vCardTra.py contacts.vcf --template myformat.txt -o out.txt
+```
+
+Example template file:
+```
+Name: {name}
+Company: {organizations}
+Phone: {phones}
+Email: {emails}
+---
+```
+Recognised tokens: `name`, `organizations`, `title`, `phones`, `emails`, `addresses`, `urls`, `birthday`, `notes`, `nickname`, `label`, `anniversary`, `gender`, `categories`, `created`, `revised`, `source`. Multi-value fields (phones, emails, organizations, addresses, urls, notes) are joined with `, ` into a single token — there's no loop syntax for iterating them individually. A typo'd token (e.g. `{name}` misspelled as `{nam}`) is left in the output as a literal `{nam}` rather than silently becoming blank, so mistakes are easy to spot. Sort/filter/select/limit all work normally with `--template`, the same as any other `--format`.
+
+**`--watch <folder>`** polls a folder every 5 seconds and auto-converts any new or modified `.vcf` file it finds, using the normal conversion pipeline with default settings (add `--format` to change the output format). Runs in the foreground until you press `Ctrl+C` — it's not a background service.
+
+```bash
+python vCardTra.py --watch ./incoming
+python vCardTra.py --watch ./incoming --format json
+```
+
+**`--quiet`**, **`--verbose`**: opposite ends of the terminal-output dial. `--quiet` suppresses everything except errors; `--verbose` prints each field-level parsing decision (skipped fields, as they're found) plus every individual duplicate merge/warning instead of just the summary counts. Both currently apply to the default conversion pipeline only — combining either with `--merge`, `--split`, or `--convert-to` is an error rather than a silent no-op.
+
+<details>
+<summary><strong>Output Formats</strong> — click to expand full format-by-format reference (json, csv, markdown, html, ics, sql, sqlite, xml, pdf, docx)</summary>
 
 Choose the output format with `--format`. All formats share the same parsing, deduplication, sorting, filtering, and selection — only the final write step changes. `--format` errors clearly and lists what's available if you typo a format name.
 
@@ -305,8 +387,8 @@ Writes one `.json` file for the whole run — a metadata envelope plus the conta
     {
       "name": "John Smith",
       "organizations": ["Acme Corporation"],
-      "phones": ["Phone: +1-555-0101 (Work)"],
-      "emails": ["Email: john@acme.com (Work)"],
+      "phones": [{"value": "+1-555-0101", "type": "Work"}],
+      "emails": [{"value": "john@acme.com", "type": "Work"}],
       "role": "Senior Engineer",
       "timezone": "America/New_York",
       "impp": ["xmpp:john@example.com"]
@@ -317,7 +399,7 @@ Writes one `.json` file for the whole run — a metadata envelope plus the conta
 
 `meta` carries the same information as the text/VCF header rows (exported time, source, counts, versions, sort/filter/select state) as native types instead of display strings. Keys with empty or missing values are omitted from each contact for cleanliness.
 
-Phone and email values are presentation strings (`"Phone: +1-555-0101 (Work)"`), matching the internal format used everywhere else in the script — not yet structured `{"value":..., "type":...}` dicts. That refactor is planned for a future version (see Roadmap).
+Phone and email values are structured objects (`{"value": "+1-555-0101", "type": "Work"}`), with `type` as `null` when there's no TYPE parameter in the source vCard.
 
 If a contact has a decoded PHOTO or LOGO, it's included as base64:
 ```json
@@ -327,7 +409,7 @@ Use `--no-photos` to omit these and shrink the file.
 
 #### csv
 
-A wide table, one row per contact. Multi-value fields (phones, emails, addresses, URLs) get numbered columns — `Phone1`, `Phone2`, etc. — sized to whichever contact in the run has the most values for that field. Photos aren't included (no sane CSV representation).
+A wide table, one row per contact. Multi-value fields get numbered columns sized to whichever contact in the run has the most values for that field: `Address1`, `Address2`, etc. for addresses/URLs. Phones and emails additionally get a paired type column — `Phone1`, `Phone1Type`, `Phone2`, `Phone2Type`, ... `Email1`, `Email1Type`, ... — so the type is independently sortable/filterable in a spreadsheet rather than baked into the value cell. Photos aren't included (no sane CSV representation).
 
 #### markdown / md
 
@@ -361,6 +443,10 @@ The same information as `json`, structured as XML instead.
 
 *Requires `pip install python-docx`.* A Word document — one heading and field list per contact, photo inserted inline as an image when present and valid.
 
+`template` (a twelfth, user-defined format) is covered separately under [Utility flags](#utility-flags) above, since it needs its own `--template <file>` argument rather than just `--format template`.
+
+</details>
+
 ### --preview
 
 Launches an interactive preview instead of writing a file. All sorting, filtering, and selection flags work exactly as in normal mode — contacts are processed first, then the preview opens on the result.
@@ -376,6 +462,27 @@ If the `textual` library is installed (`pip install textual`), a full two-panel 
 - `q` — quit
 
 If `textual` is not installed, a paged terminal fallback runs automatically — no error, no crash. 8 contacts per page; Enter/n = next page, `b` = back, `d` = detail view, `/` = search, `q` = quit.
+
+```
+vCardTra — 1 file to process
+
+  Reading test_contacts.vcf ... 69 contacts, 3 malformed
+vCardTra — Preview  (61 contacts)
+
+  #    Name              Org               Phone
+  ---- ----------------- ----------------- -----------
+  1    John Smith        Acme Corporation  +1-555-0101
+  2    Partial Paula     Paula Inc
+  3    jane doe          Freelancer        +1-555-0301
+  4    Mixed Case Mike   Mike Co           +1-555-0401
+  5    Group Guy                           +1-555-0501
+  6    Multi Value Mary  Company A         +1-555-0601
+  7    Dedup Dana                          +1-555-0701
+  8    Custom Carl                         +1-555-0802
+
+  Page 1/8  |  Enter/n=next  b=back  d=detail  /search  q=quit
+  >
+```
 
 **`--preview --browser`** skips both terminal modes and opens a one-shot HTML snapshot in your system's default browser instead — the same layout as `--format html`. It's a quick look, not an interactive session: no live search/select/export inside the browser tab. `--browser` on its own (without `--preview`) is an error, since it's a display-mode switch for preview, not a standalone flag.
 
@@ -436,7 +543,8 @@ Any conversion-level issues appear at the very bottom of the file:
 
 ---
 
-## Recognised Properties
+<details>
+<summary><strong>Recognised Properties</strong> — click to expand the full vCard field reference</summary>
 
 | Property | Type | Description |
 |---|---|---|
@@ -466,6 +574,8 @@ Any conversion-level issues appear at the very bottom of the file:
 **TYPE parameter support:** Phone and email types are automatically detected and labelled (Work, Home, Mobile, Cell, Voice, Internet, Pref, etc.) for both vCard 2.1 and 3.0+ formats.
 
 Binary fields with no practical use in any output format (SOUND, KEY) are silently skipped.
+
+</details>
 
 ---
 
@@ -502,7 +612,8 @@ Fields that fail validation are skipped and reported. The rest of the contact is
 
 ---
 
-## Troubleshooting
+<details>
+<summary><strong>Troubleshooting</strong> — click to expand common issues and fixes</summary>
 
 **"No files found matching '*.vcf'"**
 Use quotes around wildcard patterns: `"*.vcf"`. Without quotes, some shells expand the pattern before Python sees it. You can also specify the full path: `"/path/to/files/*.vcf"`
@@ -518,6 +629,8 @@ Check the `[Conversion Warnings]` section at the bottom of the output file. It l
 
 **"Error: No .vcf files found"**
 Verify the files have the `.vcf` extension. Use `ls *.vcf` (Unix/macOS) or `dir *.vcf` (Windows) to confirm files exist in the current directory.
+
+</details>
 
 ---
 
@@ -542,7 +655,7 @@ Works on Windows, macOS, and Linux — anywhere Python 3.8+ runs.
 
 ## Roadmap
 
-All planned v4 output formats are implemented (see Output Formats above). Looking further ahead: a VCF-to-VCF version converter, a structured phones/emails data model (currently presentation strings — see the json/csv/sql sections above), and various utility flags (`--dedup-only`, `--validate`, `--dry-run`, `--diff`, and others) are planned for a future version. See [CHANGELOG.md](CHANGELOG.md) for progress.
+v5 is released: structured phone/email data model, `--convert-to` version converter, and nine utility flags (`--dedup-only`, `--validate`, `--diff`, `--update`, `--template`, `--watch`, `--quiet`, `--verbose`, `--dry-run`). See [CHANGELOG.md](CHANGELOG.md) for full history.
 
 ---
 
@@ -559,5 +672,5 @@ See [CHANGELOG.md](CHANGELOG.md) for full version history.
 ---
 
 **Program:** vCardTra
-**Version:** 4.0
-**Last Updated:** August 2026
+**Version:** 5.0
+**Last Updated:** October 2026

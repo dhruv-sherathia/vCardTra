@@ -1,10 +1,102 @@
 # Changelog
 
-## [4.0] — Current
+## [5.0] — Current
+
+### Changed
+
+- **Structured phone/email data model** — phones and emails are stored
+  internally as `{'value': ..., 'type': ...}` dicts instead of pre-built
+  display strings (CONTEXT.md → D1). Effects:
+  - **JSON / XML** — `phones`/`emails` are arrays of `{"value", "type"}`
+    objects
+  - **CSV** — `Phone{i}`/`Email{i}` columns gain paired `Phone{i}Type`/
+    `Email{i}Type` columns
+  - **VCF** — `format_vcf()` maps fields directly instead of re-parsing
+    display strings
+  - **SQL / SQLite, text, Markdown, HTML, DOCX** — unchanged in appearance
+  - Text and VCF output verified byte-identical to v4; `--stats` counts
+    identical on the 72-block test file
+- **README restructured** — the three reference-heavy sections (Output
+  Formats, Recognised Properties, Troubleshooting) are now collapsible,
+  and a terminal-preview example and project icon were added
+
+### Added
+
+- **`--convert-to <version>`** — converts any input to a single merged,
+  deduplicated `.vcf` at version `3.0` or `4.0` (`2.1` is not offered as a
+  target — CONTEXT.md → D10). Mutually exclusive with `--merge`, `--split`,
+  `--format` and `--preview`. Default output name gets a `_v30`/`_v40`
+  suffix.
+  - 4.0 output uses `tel:`/`mailto:` URIs for TEL/EMAIL; 3.0 does not
+  - Yearless dates (`--MMDD`) are written as-is for 4.0. 3.0 has no valid
+    form for them, so the field is skipped and counted in the terminal
+    summary
+  - `--merge` and `--convert-to` share one implementation
+    (`_write_merged_vcf()`)
+- **Nine utility flags:**
+  - **`--dedup-only`** — duplicate report only; writes no file
+  - **`--validate`** — per-contact validation report, grouped by contact;
+    writes no file
+  - **`--quiet`** — suppresses all non-error terminal output
+  - **`--verbose`** — prints each skipped field as it is found and lists
+    every duplicate pair by name
+  - **`--dry-run`** — runs the full pipeline and prints the summary, but
+    writes no file
+  - **`--diff a.vcf b.vcf`** (D11) — field-level comparison; contacts are
+    matched by name; reports added, removed and changed contacts
+  - **`--update base.vcf new.vcf`** (D12) — merges `new.vcf` into
+    `base.vcf`; `new.vcf` wins on identity fields, and fields missing from
+    it are kept from `base.vcf`. Writes a `.vcf`
+  - **`--template <file>`** (D13) — `{token}` placeholder output
+    (`{name}`, `{phones}`, `{emails}`, ...). No loops or conditionals;
+    unknown tokens are left literal so typos are visible. Implies
+    `--format template`
+  - **`--watch <folder>`** (D14) — foreground polling loop (5s) that
+    converts new or modified `.vcf` files until `Ctrl+C`. No new
+    dependencies
+- `--quiet`, `--verbose` and `--dry-run` apply to the default conversion
+  pipeline only; combining them with `--merge`, `--split` or
+  `--convert-to` is an error
+- New test files `test_diff_before.vcf` / `test_diff_after.vcf` covering
+  every `--diff`/`--update` case (changed, unchanged, added, removed)
+
+### Fixed
+
+- **`--sort-by birthday` sorted alphabetically by month name** ("April"
+  before "January"). Birthdays and anniversaries now also store a
+  chronological raw key at parse time, used for sorting in both the normal
+  and `--preview` pipelines (D16)
+- **`format_ics()` could emit invalid events** for impossible dates such as
+  April 31. These are now skipped and counted in the terminal summary
+- **`format_vcf()` wrote `BDAY:April 12, 1985`** (the display string) in
+  `--merge`/`--split` output instead of valid vCard syntax
+  (`BDAY:19850412`). Present since v4
+- **`--update` dropped the base file's birthday** when the new file had none
+- **`--diff` and `--update` continued past a missing file** and reported a
+  misleading result; either file missing is now a clear error
+- **`--watch --format pdf`/`docx`** now checks for the optional dependency
+  at startup, not after the first file arrives
+- **`--quiet`/`--verbose`** were silent no-ops with `--merge`/`--split`/
+  `--convert-to`; the combination is now an error
+- **Misleading terminal wording** — the summary said "exported" even for
+  `--stats` and `--dry-run`, and "review output file" even when no file
+  was written. It now reads "kept" for `--stats` and "would be exported"
+  for `--dry-run` (D15)
+- `--diff`/`--update` summaries now include a `Malformed:` line when either
+  file had malformed contacts
+- `--help` now lists all 12 `--format` values and every output that
+  `--no-photos` affects (JSON, HTML, XML, PDF, DOCX)
+- Docstrings corrected to match behavior: `_load_contacts()` (callers and
+  `None` contract), `run_paged_preview()` (the `d` detail control) and
+  `identity_key()` (IMPP is intentionally not an identity field)
+- Unused variables and unnecessary `f""` prefixes removed
+
+---
+
+## [4.0]
 
 Renamed from vCard2text to vCardTra. Multi-format output and new field
-parsing. All planned v4 output formats are implemented; ready to tag and
-release.
+parsing.
 
 ### Added
 
